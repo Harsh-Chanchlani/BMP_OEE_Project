@@ -1,0 +1,22 @@
+# Python virtual environments
+venv/
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Secrets / local credentials
+api-key-*.txt
+*.pem
+*.key
+*.crt
+*.env
+ccloud-python-client/client.properties
+
+# Misc
+*.zip
+.cph/
