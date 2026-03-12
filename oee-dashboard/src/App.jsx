@@ -1,0 +1,395 @@
+import { useState, useEffect, useCallback } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine, AreaChart, Area,
+} from "recharts";
+
+const API = "http://localhost:8000";
+
+// ── OEE threshold helper ──
+function getThreshold(value) {
+  if (value >= 85) return { label: "WORLD CLASS", color: "#00ff87", bg: "rgba(0,255,135,0.1)" };
+  if (value >= 75) return { label: "GOOD",        color: "#f5c518", bg: "rgba(245,197,24,0.1)" };
+  if (value >= 60) return { label: "AVERAGE",     color: "#ff8c42", bg: "rgba(255,140,66,0.1)" };
+  return              { label: "POOR",             color: "#ff4757", bg: "rgba(255,71,87,0.1)" };
+}
+
+// ── Gauge Arc SVG ──
+function GaugeArc({ value, size = 140 }) {
+  const r = 46, cx = size / 2, cy = size / 2 + 10;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const start = -210, end = 30;
+  const filled = start + (value / 100) * (end - start);
+  const arc = (from, to) => {
+    const x1 = cx + r * Math.cos(toRad(from)), y1 = cy + r * Math.sin(toRad(from));
+    const x2 = cx + r * Math.cos(toRad(to)),   y2 = cy + r * Math.sin(toRad(to));
+    return `M ${x1} ${y1} A ${r} ${r} 0 ${to - from > 180 ? 1 : 0} 1 ${x2} ${y2}`;
+  };
+  const { color } = getThreshold(value);
+  return (
+    <svg width={size} height={size} style={{ overflow: "visible" }}>
+      <path d={arc(start, end)}   fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="8" strokeLinecap="round" />
+      <path d={arc(start, filled)} fill="none" stroke={color} strokeWidth="8" strokeLinecap="round"
+        style={{ filter: `drop-shadow(0 0 6px ${color})` }} />
+      <text x={cx} y={cy + 4}  textAnchor="middle" fill={color} fontSize="18" fontWeight="800" fontFamily="'Courier New', monospace">
+        {value.toFixed(1)}%
+      </text>
+      <text x={cx} y={cy + 20} textAnchor="middle" fill="rgba(255,255,255,0.4)" fontSize="8" fontFamily="'Courier New', monospace" letterSpacing="2">
+        OEE
+      </text>
+    </svg>
+  );
+}
+
+function StatusBadge({ value }) {
+  const t = getThreshold(value);
+  return (
+    <span style={{ background: t.bg, border: `1px solid ${t.color}`, color: t.color,
+      padding: "2px 10px", borderRadius: 4, fontSize: 10, fontFamily: "monospace",
+      letterSpacing: "2px", fontWeight: 700 }}>{t.label}</span>
+  );
+}
+
+function StatCard({ label, value, unit = "%", sub, color = "#00ff87", icon }) {
+  return (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)",
+      borderRadius: 12, padding: "16px 20px", display: "flex", flexDirection: "column",
+      gap: 4, position: "relative", overflow: "hidden" }}>
+      <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2,
+        background: `linear-gradient(90deg, transparent, ${color}, transparent)` }} />
+      <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, letterSpacing: "1.5px",
+        textTransform: "uppercase", fontFamily: "monospace" }}>{icon} {label}</div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+        <span style={{ color, fontSize: 28, fontWeight: 800, fontFamily: "'Courier New', monospace", letterSpacing: -1 }}>
+          {typeof value === "number" ? value.toFixed(2) : value}
+        </span>
+        <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 14 }}>{unit}</span>
+      </div>
+      {sub && <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 11, fontFamily: "monospace" }}>{sub}</div>}
+    </div>
+  );
+}
+
+const CustomTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={{ background: "#0d1117", border: "1px solid rgba(0,255,135,0.3)",
+      borderRadius: 8, padding: "10px 14px", fontFamily: "monospace" }}>
+      <div style={{ color: "rgba(255,255,255,0.5)", fontSize: 11, marginBottom: 6 }}>{label}</div>
+      {payload.map((p) => (
+        <div key={p.name} style={{ color: p.color, fontSize: 12 }}>
+          {p.name.toUpperCase()}: <strong>{Number(p.value)?.toFixed(2)}%</strong>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+export default function OEEDashboard() {
+  const [machines, setMachines]   = useState([]);
+  const [machine, setMachine]     = useState("");
+  const [history, setHistory]     = useState([]);
+  const [latest, setLatest]       = useState(null);
+  const [stats, setStats]         = useState(null);
+  const [alerts, setAlerts]       = useState([]);
+  const [loading, setLoading]     = useState(true);
+  const [error, setError]         = useState(null);
+  const [lastRefresh, setLastRefresh] = useState(null);
+
+  // ── Fetch machine list once on mount ──
+  useEffect(() => {
+    fetch(`${API}/api/machines`)
+      .then((r) => r.json())
+      .then((list) => {
+        setMachines(list);
+        if (list.length > 0) setMachine(list[0]);
+      })
+      .catch(() => setError("Cannot reach API. Is api.py running on port 8000?"));
+  }, []);
+
+  // ── Fetch data for selected machine ──
+  const fetchData = useCallback(() => {
+    if (!machine) return;
+    setError(null);
+
+    Promise.all([
+      fetch(`${API}/api/oee/history?machine=${machine}&limit=30`).then((r) => r.json()),
+      fetch(`${API}/api/oee/latest?machine=${machine}`).then((r) => r.json()),
+      fetch(`${API}/api/oee/stats?machine=${machine}`).then((r) => r.json()),
+    ])
+      .then(([hist, lat, st]) => {
+        // Format history for chart
+        const formatted = hist.map((row) => ({
+          time: new Date(row.window_start).toLocaleTimeString(),
+          oee: parseFloat(Number(row.avg_oee).toFixed(2)),
+          window_start: row.window_start,
+          window_end: row.window_end,
+        }));
+        setHistory(formatted);
+        setLatest(lat);
+        setStats(st);
+        setLastRefresh(new Date().toLocaleTimeString());
+        setLoading(false);
+
+        // Alert if latest OEE is below threshold
+        if (lat?.avg_oee && lat.avg_oee < 75) {
+          const sev = lat.avg_oee < 65 ? "crit" : "warn";
+          setAlerts((prev) => [
+            { id: Date.now(), msg: `OEE dropped to ${Number(lat.avg_oee).toFixed(2)}% on ${machine}`,
+              time: new Date().toLocaleTimeString(), sev },
+            ...prev.slice(0, 4),
+          ]);
+        }
+      })
+      .catch(() => {
+        setError("Failed to fetch data. Check your Postgres connection and api.py.");
+        setLoading(false);
+      });
+  }, [machine]);
+
+  // ── Poll every 10 seconds ──
+  useEffect(() => {
+    if (!machine) return;
+    setLoading(true);
+    fetchData();
+    const id = setInterval(fetchData, 10000);
+    return () => clearInterval(id);
+  }, [fetchData, machine]);
+
+  const current  = latest  || {};
+  const oeeVal   = Number(current.avg_oee  || 0);
+  const avg15    = Number(stats?.avg_oee   || 0);
+  const minOEE   = Number(stats?.min_oee   || 0);
+  const maxOEE   = Number(stats?.max_oee   || 0);
+  const thresh   = getThreshold(oeeVal);
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#080b10", color: "#e8eaf0",
+      fontFamily: "'Courier New', monospace", padding: 0 }}>
+
+      <style>{`
+        @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+        @keyframes slideIn { from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1} }
+        @keyframes spin { from{transform:rotate(0deg)}to{transform:rotate(360deg)} }
+        ::-webkit-scrollbar{width:4px;height:4px}
+        ::-webkit-scrollbar-thumb{background:rgba(0,255,135,0.2);border-radius:2px}
+      `}</style>
+
+      {/* ── Top Bar ── */}
+      <div style={{ background: "rgba(0,0,0,0.6)", borderBottom: "1px solid rgba(0,255,135,0.15)",
+        padding: "12px 32px", display: "flex", alignItems: "center", justifyContent: "space-between",
+        backdropFilter: "blur(10px)", position: "sticky", top: 0, zIndex: 100 }}>
+        <div>
+          <div style={{ color: "#00ff87", fontSize: 18, fontWeight: 800, letterSpacing: "3px" }}>⬡ OEE MONITOR</div>
+          <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: "2px" }}>KAFKA → SPARK → POSTGRES → REACT</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
+          {lastRefresh && (
+            <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 10 }}>
+              Last: {lastRefresh}
+            </span>
+          )}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 7, height: 7, borderRadius: "50%", background: error ? "#ff4757" : "#00ff87",
+              boxShadow: `0 0 8px ${error ? "#ff4757" : "#00ff87"}`, animation: "pulse 1.5s infinite" }} />
+            <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 11, letterSpacing: "1px" }}>
+              {error ? "DISCONNECTED" : "LIVE · 10s POLL"}
+            </span>
+          </div>
+          <select value={machine} onChange={(e) => setMachine(e.target.value)}
+            style={{ background: "rgba(0,255,135,0.08)", border: "1px solid rgba(0,255,135,0.3)",
+              color: "#00ff87", padding: "6px 12px", borderRadius: 6, fontFamily: "monospace",
+              fontSize: 12, cursor: "pointer", outline: "none" }}>
+            {machines.map((m) => <option key={m} value={m} style={{ background: "#0d1117" }}>{m}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* ── Error Banner ── */}
+      {error && (
+        <div style={{ background: "rgba(255,71,87,0.1)", border: "1px solid rgba(255,71,87,0.4)",
+          margin: "16px 32px", padding: "12px 20px", borderRadius: 8, color: "#ff4757",
+          fontSize: 12, letterSpacing: "1px" }}>
+          ⚠ {error}
+        </div>
+      )}
+
+      {/* ── Loading spinner ── */}
+      {loading && !error && (
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: 200 }}>
+          <div style={{ width: 32, height: 32, border: "3px solid rgba(0,255,135,0.1)",
+            borderTop: "3px solid #00ff87", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+        </div>
+      )}
+
+      {!loading && (
+        <div style={{ padding: "24px 32px", display: "flex", flexDirection: "column", gap: 24 }}>
+
+          {/* ── Row 1: Gauge + KPIs ── */}
+          <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 20 }}>
+            <div style={{ background: "rgba(255,255,255,0.02)", border: `1px solid ${thresh.color}30`,
+              borderRadius: 16, padding: 24, display: "flex", flexDirection: "column",
+              alignItems: "center", gap: 12, position: "relative", overflow: "hidden" }}>
+              <div style={{ position: "absolute", inset: 0,
+                background: `radial-gradient(ellipse at center, ${thresh.color}08 0%, transparent 70%)` }} />
+              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: "3px" }}>CURRENT OEE</div>
+              <GaugeArc value={oeeVal} size={140} />
+              <StatusBadge value={oeeVal} />
+              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: "1px", textAlign: "center" }}>
+                {current.window_end
+                  ? `Window end: ${new Date(current.window_end).toLocaleTimeString()}`
+                  : "No data yet"}
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: "1fr 1fr", gap: 12 }}>
+              <StatCard label="Latest OEE"    value={oeeVal}  color="#00ff87" icon="◈" sub={`Machine: ${machine}`} />
+              <StatCard label="15-min Avg"    value={avg15}   color="#f59e0b" icon="∿" sub="Last 15 minutes" />
+              <StatCard label="15-min Max"    value={maxOEE}  color="#34d399" icon="↑" sub="Rolling window" />
+              <StatCard label="15-min Min"    value={minOEE}  color="#ff6b6b" icon="↓" sub="Rolling window" />
+              <StatCard label="Total Windows" value={stats?.total_windows || 0} unit="" color="#60a5fa" icon="▦" sub="In last 15 min" />
+              <StatCard label="Data Points"   value={history.length} unit="" color="#a78bfa" icon="≡" sub="Chart history" />
+            </div>
+          </div>
+
+          {/* ── Row 2: OEE Trend ── */}
+          <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+            borderRadius: 16, padding: "20px 24px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "2px", color: "rgba(255,255,255,0.8)" }}>OEE TREND</div>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>
+                  Real data · Spark 1-min sliding windows · 30s slide
+                </div>
+              </div>
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", letterSpacing: "1px" }}>
+                {history.length} POINTS
+              </span>
+            </div>
+            {history.length === 0 ? (
+              <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center",
+                color: "rgba(255,255,255,0.2)", fontSize: 12 }}>
+                No history data yet — start your Producer.py and Spark job
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height={200}>
+                <LineChart data={history} margin={{ top: 5, right: 5, bottom: 0, left: -20 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+                  <XAxis dataKey="time" tick={{ fill: "rgba(255,255,255,0.2)", fontSize: 9 }}
+                    tickLine={false} axisLine={false} interval={Math.floor(history.length / 6)} />
+                  <YAxis domain={[50, 100]} tick={{ fill: "rgba(255,255,255,0.2)", fontSize: 9 }}
+                    tickLine={false} axisLine={false} />
+                  <Tooltip content={<CustomTooltip />} />
+                  <ReferenceLine y={85} stroke="rgba(0,255,135,0.2)" strokeDasharray="4 4"
+                    label={{ value: "85% World Class", fill: "rgba(0,255,135,0.4)", fontSize: 9 }} />
+                  <ReferenceLine y={75} stroke="rgba(245,197,24,0.2)" strokeDasharray="4 4"
+                    label={{ value: "75% Good", fill: "rgba(245,197,24,0.3)", fontSize: 9 }} />
+                  <Line type="monotone" dataKey="oee" stroke="#00ff87" strokeWidth={2}
+                    dot={false} isAnimationActive={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+
+          {/* ── Row 3: Table + Alerts ── */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 20 }}>
+            {/* Table */}
+            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+              borderRadius: 16, overflow: "hidden" }}>
+              <div style={{ padding: "16px 24px", borderBottom: "1px solid rgba(255,255,255,0.05)",
+                display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "2px", color: "rgba(255,255,255,0.8)" }}>
+                    WINDOW AGGREGATES
+                  </div>
+                  <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>
+                    Live from oee_data · Spark micro-batches
+                  </div>
+                </div>
+              </div>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead>
+                    <tr style={{ background: "rgba(255,255,255,0.03)" }}>
+                      {["MACHINE ID", "WINDOW START", "WINDOW END", "AVG OEE", "STATUS"].map((h) => (
+                        <th key={h} style={{ padding: "10px 20px", textAlign: "left", fontSize: 9,
+                          letterSpacing: "2px", color: "rgba(255,255,255,0.3)", fontWeight: 700,
+                          borderBottom: "1px solid rgba(255,255,255,0.05)" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...history].reverse().slice(0, 10).map((row, i) => {
+                      const t = getThreshold(row.oee);
+                      return (
+                        <tr key={i} style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}
+                          onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255,255,255,0.03)"}
+                          onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                          <td style={{ padding: "10px 20px", fontSize: 12, color: "#60a5fa" }}>{machine}</td>
+                          <td style={{ padding: "10px 20px", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
+                            {row.window_start ? new Date(row.window_start).toLocaleTimeString() : row.time}
+                          </td>
+                          <td style={{ padding: "10px 20px", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
+                            {row.window_end ? new Date(row.window_end).toLocaleTimeString() : "—"}
+                          </td>
+                          <td style={{ padding: "10px 20px", fontSize: 13, color: t.color, fontWeight: 700 }}>
+                            {row.oee.toFixed(2)}%
+                          </td>
+                          <td style={{ padding: "10px 20px" }}><StatusBadge value={row.oee} /></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Alerts + sparkline */}
+            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
+              borderRadius: 16, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: "16px 20px", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "2px", color: "rgba(255,255,255,0.8)" }}>ALERT LOG</div>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>Triggered when OEE &lt; 75%</div>
+              </div>
+              <div style={{ flex: 1, padding: "12px 16px", display: "flex", flexDirection: "column",
+                gap: 8, overflowY: "auto", maxHeight: 200 }}>
+                {alerts.length === 0 ? (
+                  <div style={{ color: "rgba(255,255,255,0.2)", fontSize: 11, textAlign: "center", marginTop: 30 }}>
+                    ✓ No alerts — system nominal
+                  </div>
+                ) : alerts.map((a) => (
+                  <div key={a.id} style={{ background: a.sev === "crit" ? "rgba(255,71,87,0.08)" : "rgba(255,140,66,0.08)",
+                    border: `1px solid ${a.sev === "crit" ? "rgba(255,71,87,0.3)" : "rgba(255,140,66,0.3)"}`,
+                    borderRadius: 8, padding: "8px 12px", animation: "slideIn 0.3s ease" }}>
+                    <div style={{ fontSize: 10, color: a.sev === "crit" ? "#ff4757" : "#ff8c42", fontWeight: 700 }}>
+                      {a.sev === "crit" ? "⚠ CRITICAL" : "△ WARNING"}
+                    </div>
+                    <div style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", marginTop: 2 }}>{a.msg}</div>
+                    <div style={{ fontSize: 9,  color: "rgba(255,255,255,0.2)", marginTop: 3 }}>{a.time}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ padding: "12px 16px", borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ fontSize: 9, color: "rgba(255,255,255,0.25)", letterSpacing: "1px", marginBottom: 6 }}>
+                  OEE SPARKLINE (last 20 windows)
+                </div>
+                <ResponsiveContainer width="100%" height={50}>
+                  <AreaChart data={history.slice(-20)} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                    <defs>
+                      <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%"   stopColor="#00ff87" stopOpacity={0.3} />
+                        <stop offset="100%" stopColor="#00ff87" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <Area type="monotone" dataKey="oee" stroke="#00ff87" strokeWidth={1.5}
+                      fill="url(#sparkGrad)" dot={false} isAnimationActive={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

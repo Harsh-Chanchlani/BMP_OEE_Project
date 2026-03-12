@@ -78,9 +78,9 @@ try:
         # Simulate OEE Data
         data = {
             "machine_id": "M2_MAC_SIM",
-            "availability": round(random.uniform(85, 95), 2),
-            "performance": round(random.uniform(90, 98), 2),
-            "quality": round(random.uniform(98, 100), 2),
+            "availability": round(random.uniform(70, 95), 2),
+            "performance": round(random.uniform(70, 98), 2),
+            "quality": round(random.uniform(80, 100), 2),
             "timestamp": time.time()
         }
         # Calculate OEE locally as we planned
