@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OEEMessage",
+  "type": "object",
+  "required": ["machine_id", "availability", "performance", "quality",
+               "timestamp", "oee", "message_id"],
+  "additionalProperties": false,
+  "properties": {
+    "machine_id":    { "type": "string", "minLength": 1, "maxLength": 64 },
+    "availability":  { "type": "number", "minimum": 0, "maximum": 100 },
+    "performance":   { "type": "number", "minimum": 0, "maximum": 100 },
+    "quality":       { "type": "number", "minimum": 0, "maximum": 100 },
+    "oee":           { "type": "number", "minimum": 0, "maximum": 100 },
+    "timestamp":     { "type": "number", "minimum": 0 },
+    "message_id":    { "type": "string", "format": "uuid" },
+    "shift":         { "type": "string" },
+    "message_number":{ "type": "number" },
+    "loss_event":    { "type": "object" },
+    "lot_id":        { "type": "string" },
+    "recipe_name":   { "type": "string" },
+    "chamber_id":    { "type": "string" }
+  }
+}

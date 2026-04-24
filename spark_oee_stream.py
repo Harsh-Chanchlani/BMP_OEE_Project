@@ -1,15 +1,17 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, window, avg, from_unixtime
+from pyspark.sql.functions import from_json, col, window, avg, from_unixtime, year, month, dayofmonth, hour
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 import pyspark
 import psycopg2
 import os
-
+import json
+import uuid
+from datetime import datetime
+from confluent_kafka import Producer as ConfluentProducer
 
 def load_env_file(path):
     if not os.path.exists(path):
         return
-
     with open(path, "r", encoding="utf-8") as file:
         for raw_line in file:
             line = raw_line.strip()
@@ -18,11 +20,9 @@ def load_env_file(path):
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
 
-
 def load_kafka_properties(path):
     if not os.path.exists(path):
         return
-
     props = {}
     with open(path, "r", encoding="utf-8") as file:
         for raw_line in file:
@@ -31,33 +31,48 @@ def load_kafka_properties(path):
                 continue
             key, value = line.split("=", 1)
             props[key.strip()] = value.strip()
-
     mapping = {
         "bootstrap.servers": "KAFKA_BOOTSTRAP_SERVERS",
         "sasl.username": "KAFKA_SASL_USERNAME",
         "sasl.password": "KAFKA_SASL_PASSWORD",
     }
-
     for src_key, env_key in mapping.items():
         if src_key in props:
             os.environ.setdefault(env_key, props[src_key])
 
-
 load_env_file(".env")
 load_kafka_properties("ccloud-python-client/client.properties")
 
+# DB Config
 DB_NAME = os.getenv("PGDATABASE", "oee_db")
 DB_USER = os.getenv("PGUSER", "harshchanchlani")
 DB_PASSWORD = os.getenv("PGPASSWORD", "")
 DB_HOST = os.getenv("PGHOST", "localhost")
 DB_PORT = os.getenv("PGPORT", "5432")
 
+# Kafka Config
+bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
+kafka_username = os.getenv("KAFKA_SASL_USERNAME", "")
+kafka_password = os.getenv("KAFKA_SASL_PASSWORD", "")
+
+# Upgrade 3B: Initialize alert producer once at module level
+alert_config = {
+    'bootstrap.servers': bootstrap_servers,
+    'security.protocol': 'SASL_SSL',
+    'sasl.mechanisms': 'PLAIN',
+    'sasl.username': kafka_username,
+    'sasl.password': kafka_password,
+}
+try:
+    alert_producer = ConfluentProducer(alert_config)
+except Exception as e:
+    print(f"[WARN] Could not initialize alert producer: {e}")
+    alert_producer = None
+
+# Spark Packages
 spark_version = ".".join(pyspark.__version__.split(".")[:3])
-scala_binary_version = os.getenv("SPARK_SCALA_BINARY_VERSION", "2.13")
-default_kafka_pkg = (
-    f"org.apache.spark:spark-sql-kafka-0-10_{scala_binary_version}:{spark_version}"
-)
-spark_kafka_pkg = os.getenv("SPARK_KAFKA_PACKAGE", default_kafka_pkg)
+scala_binary_version = os.getenv("SPARK_SCALA_BINARY_VERSION", "2.12")
+spark_kafka_pkg = f"org.apache.spark:spark-sql-kafka-0-10_{scala_binary_version}:{spark_version}"
 spark_extra_packages = os.getenv("SPARK_EXTRA_PACKAGES", "")
 
 packages = [spark_kafka_pkg]
@@ -66,21 +81,24 @@ if spark_extra_packages.strip():
 
 spark = (
     SparkSession.builder
-    .appName("OEEStreaming")
+    .appName("OEEStreaming_Upgraded")
     .config("spark.jars.packages", ",".join(packages))
     .getOrCreate()
 )
 
-# ---------------- Kafka Config ----------------
-bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "pkc-619z3.us-east1.gcp.confluent.cloud:9092")
-kafka_username = os.getenv("KAFKA_SASL_USERNAME", "")
-kafka_password = os.getenv("KAFKA_SASL_PASSWORD", "")
+# Upgrade 4C: MinIO Config
+DATALAKE_ENABLED = os.getenv("DATALAKE_ENABLED", "true").lower() == "true"
+MINIO_ENDPOINT   = os.getenv("MINIO_ENDPOINT",   "http://localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
+DATALAKE_BUCKET  = os.getenv("DATALAKE_BUCKET",  "oee-datalake")
 
-if not kafka_username or not kafka_password:
-    raise RuntimeError(
-        "Missing Kafka credentials. Set KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD "
-        "in .env or environment variables."
-    )
+if DATALAKE_ENABLED:
+    spark._jsc.hadoopConfiguration().set("fs.s3a.endpoint", MINIO_ENDPOINT)
+    spark._jsc.hadoopConfiguration().set("fs.s3a.access.key", MINIO_ACCESS_KEY)
+    spark._jsc.hadoopConfiguration().set("fs.s3a.secret.key", MINIO_SECRET_KEY)
+    spark._jsc.hadoopConfiguration().set("fs.s3a.path.style.access", "true")
+    spark._jsc.hadoopConfiguration().set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
 
 kafka_options = {
     "kafka.bootstrap.servers": bootstrap_servers,
@@ -95,32 +113,24 @@ kafka_options = {
     )
 }
 
-df = spark.readStream \
-    .format("kafka") \
-    .options(**kafka_options) \
-    .load()
+df = spark.readStream.format("kafka").options(**kafka_options).load()
 
-# ---------------- JSON Schema ----------------
 schema = StructType([
     StructField("machine_id", StringType()),
     StructField("availability", DoubleType()),
     StructField("performance", DoubleType()),
     StructField("quality", DoubleType()),
     StructField("timestamp", DoubleType()),
-    StructField("oee", DoubleType())
+    StructField("oee", DoubleType()),
+    StructField("message_id", StringType())
 ])
 
 parsed = df.selectExpr("CAST(value AS STRING)") \
     .select(from_json(col("value"), schema).alias("data")) \
-    .select("data.*")
+    .select("data.*") \
+    .withColumn("event_time", from_unixtime(col("timestamp")).cast("timestamp"))
 
-# ---------------- Convert UNIX → Timestamp ----------------
-parsed = parsed.withColumn(
-    "event_time",
-    from_unixtime(col("timestamp")).cast("timestamp")
-)
-
-# ---------------- Window Aggregation ----------------
+# Aggregation for Postgres
 windowed = parsed \
     .withWatermark("event_time", "2 minutes") \
     .groupBy(
@@ -129,71 +139,87 @@ windowed = parsed \
     ) \
     .agg(avg("oee").alias("avg_oee"))
 
-# ---------------- Write to Postgres ----------------
+# Upgrade 3B thresholds
+WARNING_THRESHOLD  = float(os.getenv("OEE_WARNING_THRESHOLD",  "70.0"))
+CRITICAL_THRESHOLD = float(os.getenv("OEE_CRITICAL_THRESHOLD", "55.0"))
+ALERT_TOPIC = os.getenv("ALERT_TOPIC", "OEE_ALERTS")
+
 def write_to_postgres(batch_df, batch_id):
-
     rows = batch_df.collect()
+    if not rows: return
 
-    if len(rows) == 0:
-        return
-
-    conn = psycopg2.connect(
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        port=DB_PORT
-    )
-
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS oee_data (
-            id BIGSERIAL PRIMARY KEY,
-            machine_id TEXT NOT NULL,
-            window_start TIMESTAMP NOT NULL,
-            window_end TIMESTAMP NOT NULL,
-            avg_oee DOUBLE PRECISION NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-    """)
-
-    cursor.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_oee_data_window_start
-        ON oee_data (window_start)
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_oee_data_machine_window
-        ON oee_data (machine_id, window_start)
-        """
-    )
+    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+    cur = conn.cursor()
 
     for row in rows:
-        cursor.execute("""
+        # Upgrade 2D: Secondary schema validation
+        if not isinstance(row.machine_id, str) or not row.machine_id:
+            print(f"[WARN] Invalid machine_id: {row.machine_id}"); continue
+        if not (0 <= row.avg_oee <= 100):
+            print(f"[WARN] Invalid avg_oee: {row.avg_oee}"); continue
+
+        # Insert OEE data
+        cur.execute("""
             INSERT INTO oee_data (machine_id, window_start, window_end, avg_oee)
             VALUES (%s, %s, %s, %s)
-        """, (
-            row.machine_id,
-            row.window.start,
-            row.window.end,
-            row.avg_oee
-        ))
+        """, (row.machine_id, row.window.start, row.window.end, row.avg_oee))
+
+        # Upgrade 3B: Alerting logic
+        if row.avg_oee < WARNING_THRESHOLD:
+            level = "CRITICAL" if row.avg_oee < CRITICAL_THRESHOLD else "WARNING"
+            
+            # DB Insert
+            cur.execute("""
+                INSERT INTO oee_alerts (machine_id, avg_oee, threshold, window_start, window_end, alert_level)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (row.machine_id, row.avg_oee, WARNING_THRESHOLD if level == "WARNING" else CRITICAL_THRESHOLD, 
+                  row.window.start, row.window.end, level))
+            
+            # Kafka Produce
+            if alert_producer:
+                alert_payload = {
+                    "machine_id": row.machine_id,
+                    "avg_oee": round(row.avg_oee, 2),
+                    "threshold": WARNING_THRESHOLD if level == "WARNING" else CRITICAL_THRESHOLD,
+                    "alert_level": level,
+                    "window_start": row.window.start.isoformat(),
+                    "window_end": row.window.end.isoformat(),
+                    "alert_id": str(uuid.uuid4())
+                }
+                try:
+                    alert_producer.produce(ALERT_TOPIC, value=json.dumps(alert_payload).encode('utf-8'))
+                    alert_producer.poll(0)
+                except Exception as e:
+                    print(f"[WARN] Alert produce failed: {e}")
 
     conn.commit()
-    cursor.close()
+    cur.close()
     conn.close()
 
-# --------------------------------------------
-# Start Streaming Query
-# --------------------------------------------
-query = windowed.writeStream \
+# Postgres Sink
+pg_query = windowed.writeStream \
     .outputMode("update") \
     .foreachBatch(write_to_postgres) \
     .trigger(processingTime="10 seconds") \
     .start()
 
-query.awaitTermination()
+# Upgrade 4C: Data Lake Parquet Sink
+if DATALAKE_ENABLED:
+    try:
+        datalake_df = parsed.withColumn("year",  year("event_time")) \
+                            .withColumn("month", month("event_time")) \
+                            .withColumn("day",   dayofmonth("event_time")) \
+                            .withColumn("hour",  hour("event_time"))
+
+        datalake_query = datalake_df.writeStream \
+            .outputMode("append") \
+            .format("parquet") \
+            .option("path", f"s3a://{DATALAKE_BUCKET}/raw/oee_events/") \
+            .option("checkpointLocation", f"s3a://{DATALAKE_BUCKET}/checkpoints/raw/") \
+            .partitionBy("year", "month", "day", "hour") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+    except Exception as e:
+        print(f"[WARN] Datalake sink disabled: {e}")
+
+spark.streams.awaitAnyTermination()

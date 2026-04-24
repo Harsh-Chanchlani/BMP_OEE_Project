@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: oee_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin123}
+    ports:
+      - "9000:9000"   # S3 API endpoint
+      - "9001:9001"   # MinIO web console
+    volumes:
+      - minio_data:/data
+
+volumes:
+  minio_data:

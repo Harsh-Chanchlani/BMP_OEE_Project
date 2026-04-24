@@ -166,3 +166,23 @@ CREATE INDEX IF NOT EXISTS idx_alert_machine_time
 
 CREATE INDEX IF NOT EXISTS idx_alert_unacknowledged
   ON alert_history (machine_id, acknowledged) WHERE acknowledged = FALSE;
+
+-- ============================================
+-- UPGRADE 3 - OEE ALERTS
+-- ============================================
+CREATE TABLE IF NOT EXISTS oee_alerts (
+    id          BIGSERIAL PRIMARY KEY,
+    machine_id  TEXT NOT NULL,
+    avg_oee     DOUBLE PRECISION NOT NULL,
+    threshold   DOUBLE PRECISION NOT NULL,
+    window_start TIMESTAMP NOT NULL,
+    window_end   TIMESTAMP NOT NULL,
+    alert_level TEXT NOT NULL,        -- 'WARNING' or 'CRITICAL'
+    acknowledged BOOLEAN DEFAULT FALSE,
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_oee_alerts_machine_time
+    ON oee_alerts (machine_id, window_start);
+CREATE INDEX IF NOT EXISTS idx_oee_alerts_unacked
+    ON oee_alerts (acknowledged) WHERE acknowledged = FALSE;

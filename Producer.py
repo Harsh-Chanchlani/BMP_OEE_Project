@@ -1,308 +1,162 @@
 """
-Enhanced OEE Data Producer
-==========================
-Generates realistic OEE data with:
-- Shift-based patterns (morning/afternoon/night performance variations)
-- Periodic downtime events simulation
-- Six Big Losses event generation
-- Component-level data (availability, performance, quality)
-- Multiple machine support
+Semiconductor Chip Fab OEE Data Producer
+Simulates a high-tech wafer fabrication environment with SECS/GEM-style telemetry.
 """
 
 from confluent_kafka import Producer
 import json
 import time
 import random
-import math
 import os
+import uuid
 from datetime import datetime
+from schema_validator import validate_message, SchemaValidationError
 
-
-def load_env_file(path):
-    if not os.path.exists(path):
-        return
-
+def load_env_file(path=".env"):
+    if not os.path.exists(path): return
     with open(path, "r", encoding="utf-8") as file:
         for raw_line in file:
             line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
+            if not line or line.startswith("#") or "=" not in line: continue
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
 
-
-def load_kafka_properties(path):
-    if not os.path.exists(path):
-        return
-
+def load_kafka_properties(path="ccloud-python-client/client.properties"):
+    if not os.path.exists(path): return
     props = {}
     with open(path, "r", encoding="utf-8") as file:
         for raw_line in file:
             line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
+            if not line or line.startswith("#") or "=" not in line: continue
             key, value = line.split("=", 1)
             props[key.strip()] = value.strip()
-
     mapping = {
         "bootstrap.servers": "KAFKA_BOOTSTRAP_SERVERS",
         "sasl.username": "KAFKA_SASL_USERNAME",
         "sasl.password": "KAFKA_SASL_PASSWORD",
     }
-
     for src_key, env_key in mapping.items():
-        if src_key in props:
-            os.environ.setdefault(env_key, props[src_key])
+        if src_key in props: os.environ.setdefault(env_key, props[src_key])
 
+load_env_file()
+load_kafka_properties()
 
-load_env_file(".env")
-load_kafka_properties("ccloud-python-client/client.properties")
-
-
-# ============================================
-# SHIFT DEFINITIONS
-# ============================================
-def get_current_shift(hour: int) -> str:
-    """Determine shift based on hour (0-23)."""
-    if 6 <= hour < 14:
-        return "morning"
-    elif 14 <= hour < 22:
-        return "afternoon"
-    else:
-        return "night"
-
-
-def get_shift_multipliers(shift: str) -> dict:
-    """
-    Shift-based performance patterns.
-    Morning: Best performance (fresh workers, optimal conditions)
-    Afternoon: Slight decline (fatigue setting in)
-    Night: Lower performance (reduced supervision, fatigue)
-    """
-    multipliers = {
-        "morning": {
-            "availability": (0.85, 0.98),
-            "performance": (0.82, 0.98),
-            "quality": (0.90, 0.99),
-        },
-        "afternoon": {
-            "availability": (0.80, 0.95),
-            "performance": (0.78, 0.95),
-            "quality": (0.85, 0.98),
-        },
-        "night": {
-            "availability": (0.70, 0.92),
-            "performance": (0.70, 0.92),
-            "quality": (0.80, 0.96),
-        },
-    }
-    return multipliers.get(shift, multipliers["morning"])
-
-
-# ============================================
-# DOWNTIME & LOSS SIMULATION
-# ============================================
-SIX_BIG_LOSSES = {
-    "equipment_failure": {
-        "component": "availability",
-        "severity_range": (15, 40),
-        "probability": 0.02,
-        "description": "Unplanned equipment breakdown"
-    },
-    "setup_adjustment": {
-        "component": "availability",
-        "severity_range": (5, 20),
-        "probability": 0.03,
-        "description": "Setup and changeover time"
-    },
-    "idling": {
-        "component": "performance",
-        "severity_range": (5, 15),
-        "probability": 0.05,
-        "description": "Idling and minor stoppages"
-    },
-    "reduced_speed": {
-        "component": "performance",
-        "severity_range": (10, 25),
-        "probability": 0.04,
-        "description": "Running below optimal speed"
-    },
-    "defects": {
-        "component": "quality",
-        "severity_range": (3, 15),
-        "probability": 0.03,
-        "description": "Production defects and rework"
-    },
-    "reduced_yield": {
-        "component": "quality",
-        "severity_range": (2, 10),
-        "probability": 0.04,
-        "description": "Startup losses and reduced yield"
-    }
+# Semiconductor Tool Profiles (Chip Fab)
+# High precision, high PM frequency, extreme sensitivity
+MACHINE_PROFILES = {
+    "LITHO_ASML_01":  {"avail": (90, 98), "perf": (85, 95), "qual": (98, 100), "recipe": "EUV_7nm_Logic"},
+    "ETCH_LAM_02":    {"avail": (80, 92), "perf": (70, 90), "qual": (95, 99),  "recipe": "Poly_Etch_A1"},
+    "DEP_AMAT_03":    {"avail": (75, 88), "perf": (75, 92), "qual": (94, 98),  "recipe": "CVD_Nitride_HighK"},
+    "CMP_EBARA_04":   {"avail": (85, 95), "perf": (80, 95), "qual": (92, 97),  "recipe": "Copper_Planarization"},
+    "INSPECT_KLA_05": {"avail": (92, 99), "perf": (90, 98), "qual": (99, 100), "recipe": "Brightfield_Inspection"},
 }
 
+FAB_LOSS_EVENTS = [
+    {"name": "Reticle Haze", "comp": "quality", "sev": (5, 15), "prob": 0.01, "tools": ["LITHO_ASML_01"]},
+    {"name": "Vacuum Leak", "comp": "performance", "sev": (10, 25), "prob": 0.02, "tools": ["ETCH_LAM_02", "DEP_AMAT_03"]},
+    {"name": "Slurry Imbalance", "comp": "quality", "sev": (3, 10), "prob": 0.03, "tools": ["CMP_EBARA_04"]},
+    {"name": "Chamber Seasoning", "comp": "availability", "sev": (20, 40), "prob": 0.04, "tools": ["ETCH_LAM_02", "DEP_AMAT_03"]},
+    {"name": "Vibration Spike", "comp": "performance", "sev": (5, 10), "prob": 0.02, "tools": ["LITHO_ASML_01", "INSPECT_KLA_05"]},
+]
 
-class OEEDataGenerator:
-    """Generate realistic OEE data with patterns and anomalies."""
-    
-    def __init__(self, machine_id: str):
+class FabSimulator:
+    def __init__(self, machine_id):
         self.machine_id = machine_id
-        self.message_count = 0
+        self.profile = MACHINE_PROFILES.get(machine_id, {"avail": (80, 90), "perf": (80, 90), "qual": (95, 100), "recipe": "Standard_Recipe"})
+        self.msg_count = 0
         self.active_loss = None
-        self.loss_remaining_cycles = 0
-        self.baseline = {
-            "availability": 88.0,
-            "performance": 85.0,
-            "quality": 92.0
-        }
-        
-    def _apply_time_pattern(self, value: float, timestamp: float) -> float:
-        """Add sinusoidal pattern to simulate natural variations."""
-        hour_cycle = math.sin(2 * math.pi * timestamp / (3600 * 4))  # 4-hour cycle
-        minute_cycle = math.sin(2 * math.pi * timestamp / 300)  # 5-minute micro-cycle
-        variation = hour_cycle * 2 + minute_cycle * 1
-        return max(0, min(100, value + variation))
-    
-    def _check_for_loss_event(self) -> tuple:
-        """Check if a new loss event should occur. Returns (loss_type, severity)."""
-        if self.active_loss:
-            return None, 0
-            
-        for loss_type, config in SIX_BIG_LOSSES.items():
-            if random.random() < config["probability"]:
-                severity = random.uniform(*config["severity_range"])
-                duration = random.randint(3, 15)  # 3-15 cycles (6-30 seconds)
-                self.active_loss = loss_type
-                self.loss_remaining_cycles = duration
-                return loss_type, severity
-        return None, 0
-    
-    def generate(self) -> dict:
-        """Generate one OEE data point with realistic patterns."""
+        self.loss_remaining = 0
+        self.current_lot = f"LOT-{random.randint(1000, 9999)}"
+
+    def generate(self):
         now = time.time()
-        dt = datetime.fromtimestamp(now)
-        hour = dt.hour
-        shift = get_current_shift(hour)
-        shift_ranges = get_shift_multipliers(shift)
-        
-        # Base values with shift influence
-        availability = random.uniform(*[x * 100 for x in shift_ranges["availability"]])
-        performance = random.uniform(*[x * 100 for x in shift_ranges["performance"]])
-        quality = random.uniform(*[x * 100 for x in shift_ranges["quality"]])
-        
-        # Apply time-based patterns
-        availability = self._apply_time_pattern(availability, now)
-        performance = self._apply_time_pattern(performance, now)
-        quality = self._apply_time_pattern(quality, now)
-        
-        # Check for new loss events
-        loss_event = None
-        loss_type, severity = self._check_for_loss_event()
-        
-        # Apply active loss
+        # Periodic lot change every 50 messages
+        if self.msg_count % 50 == 0:
+            self.current_lot = f"LOT-{random.randint(1000, 9999)}"
+
+        avail = random.uniform(*self.profile["avail"])
+        perf = random.uniform(*self.profile["perf"])
+        qual = random.uniform(*self.profile["qual"])
+
+        # Check for loss events
         if self.active_loss:
-            loss_config = SIX_BIG_LOSSES[self.active_loss]
-            component = loss_config["component"]
-            
-            if component == "availability":
-                availability = max(30, availability - severity)
-            elif component == "performance":
-                performance = max(40, performance - severity)
-            elif component == "quality":
-                quality = max(50, quality - severity)
-            
-            loss_event = {
-                "type": self.active_loss,
-                "component": loss_config["component"],
-                "severity": round(severity, 2),
-                "description": loss_config["description"],
-                "remaining_cycles": self.loss_remaining_cycles
-            }
-            
-            self.loss_remaining_cycles -= 1
-            if self.loss_remaining_cycles <= 0:
-                self.active_loss = None
-        
-        # Calculate OEE
-        availability = round(max(0, min(100, availability)), 2)
-        performance = round(max(0, min(100, performance)), 2)
-        quality = round(max(0, min(100, quality)), 2)
-        oee = round((availability * performance * quality) / 10000, 2)
-        
-        self.message_count += 1
-        
+            loss = self.active_loss
+            if loss["comp"] == "availability": avail -= loss["sev_val"]
+            elif loss["comp"] == "performance": perf -= loss["sev_val"]
+            elif loss["comp"] == "quality": qual -= loss["sev_val"]
+            self.loss_remaining -= 1
+            if self.loss_remaining <= 0: self.active_loss = None
+        else:
+            for le in FAB_LOSS_EVENTS:
+                if self.machine_id in le["tools"] and random.random() < le["prob"]:
+                    self.active_loss = le.copy()
+                    self.active_loss["sev_val"] = random.uniform(*le["sev"])
+                    self.loss_remaining = random.randint(5, 15)
+                    break
+
+        avail = round(max(0, min(100, avail)), 2)
+        perf = round(max(0, min(100, perf)), 2)
+        qual = round(max(0, min(100, qual)), 2)
+        oee = round((avail * perf * qual) / 10000, 2)
+
         data = {
             "machine_id": self.machine_id,
-            "availability": availability,
-            "performance": performance,
-            "quality": quality,
+            "availability": avail,
+            "performance": perf,
+            "quality": qual,
             "oee": oee,
-            "shift": shift,
             "timestamp": now,
-            "message_number": self.message_count,
+            "message_id": str(uuid.uuid4()),
+            "lot_id": self.current_lot,
+            "recipe_name": self.profile["recipe"],
+            "chamber_id": f"CH-{random.randint(1, 4)}",
+            "message_number": self.msg_count
         }
+        if self.active_loss:
+            data["loss_event"] = {"name": self.active_loss["name"], "component": self.active_loss["comp"]}
         
-        # Include loss event info if active
-        if loss_event:
-            data["loss_event"] = loss_event
-        
+        self.msg_count += 1
         return data
 
-
-# ============================================
-# KAFKA CONFIGURATION
-# ============================================
+# Kafka Init
 config = {
-    'bootstrap.servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'pkc-619z3.us-east1.gcp.confluent.cloud:9092'),
+    'bootstrap.servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', ''),
     'security.protocol': 'SASL_SSL',
     'sasl.mechanisms': 'PLAIN',
     'sasl.username': os.getenv('KAFKA_SASL_USERNAME', ''),
     'sasl.password': os.getenv('KAFKA_SASL_PASSWORD', ''),
 }
-
-if not config["sasl.username"] or not config["sasl.password"]:
-    raise RuntimeError(
-        "Missing Kafka credentials. Set KAFKA_SASL_USERNAME and "
-        "KAFKA_SASL_PASSWORD in .env or environment variables."
-    )
-
 producer = Producer(config)
 topic = "OEE_0"
 
-# Support multiple machines
-MACHINES = os.getenv("OEE_MACHINES", "M2_MAC_SIM").split(",")
-generators = {m.strip(): OEEDataGenerator(m.strip()) for m in MACHINES}
-
+machines = list(MACHINE_PROFILES.keys())
+simulators = {m: FabSimulator(m) for m in machines}
 
 def delivery_report(err, msg):
-    if err is not None:
-        print(f"❌ Delivery failed: {err}")
-    else:
-        data = json.loads(msg.value().decode('utf-8'))
-        loss_indicator = " ⚠️ LOSS EVENT" if data.get("loss_event") else ""
-        print(f"✓ [{data['shift'].upper():9}] {data['machine_id']}: OEE={data['oee']:5.2f}% "
-              f"(A={data['availability']:5.2f}%, P={data['performance']:5.2f}%, Q={data['quality']:5.2f}%){loss_indicator}")
+    if err: print(f"❌ Delivery failed: {err}")
+    else: pass
 
-
-print(f"🚀 Enhanced OEE Producer Started")
-print(f"   Topic: {topic}")
-print(f"   Machines: {', '.join(generators.keys())}")
-print(f"   Features: Shift patterns, Six Big Losses simulation")
-print("-" * 60)
+print(f"🚀 Semiconductor Fab Producer Started (Confluent Cloud)")
+print(f"   Tools: {', '.join(machines)}")
 
 try:
     while True:
-        for machine_id, generator in generators.items():
-            data = generator.generate()
-            producer.produce(
-                topic, 
-                json.dumps(data).encode('utf-8'), 
-                callback=delivery_report
-            )
-        producer.poll(0)
-        time.sleep(2)  # Send every 2 seconds
+        for m_id, sim in simulators.items():
+            data = sim.generate()
+            try:
+                payload = json.dumps(data).encode('utf-8')
+                validate_message(payload) # Use shared validator
+                producer.produce(topic, key=m_id.encode('utf-8'), value=payload, callback=delivery_report)
+                
+                # Console output for visibility
+                loss_str = f" ⚠️ {data['loss_event']['name']}" if "loss_event" in data else ""
+                print(f"✓ {m_id:15} | OEE: {data['oee']:5.2f}% | Lot: {data['lot_id']}{loss_str}")
+            except SchemaValidationError as e:
+                print(f"⚠️ Validation error for {m_id}: {e}")
         
+        producer.poll(0)
+        time.sleep(2)
 except KeyboardInterrupt:
-    print("\n⏹️  Streaming stopped.")
+    print("\n⏹️ Stopped.")
 finally:
     producer.flush()
