@@ -31,3 +31,7 @@ pnpm-debug.log*
 # Misc
 *.zip
 .cph/
+
+# Logs
+logs/
+*.log

@@ -1,20 +1,41 @@
 #!/usr/bin/env bash
-# Run each in a separate terminal from the project root
+# Simple backend startup script
 
-# Terminal 1: IoT simulator / producer
-python producer/Producer.py
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_ROOT"
 
-# Terminal 2: Spark structured streaming (windowed aggregation → Postgres + alerts)
-python backend/spark_oee_stream.py
+# Activate venv if it exists
+if [ -d "venv" ]; then
+    source venv/bin/activate
+fi
 
-# Terminal 3: Schema validator / DLQ router
-python backend/validator_consumer.py
+echo "🚀 Starting OEE Backend..."
+echo ""
 
-# Terminal 4: Alert dispatcher (email / webhook)
-python backend/alert_consumer.py
+# Start Producer
+echo "📊 Starting Producer..."
+python producer/Producer.py &
+PRODUCER_PID=$!
+sleep 2
 
-# Terminal 5: FastAPI + WebSocket server
-uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload
+# Start Spark Processor
+echo "⚡ Starting Spark Processor..."
+python backend/spark_oee_stream.py &
+SPARK_PID=$!
+sleep 3
 
-# Terminal 6: React frontend
-cd oee-dashboard && npm run dev
+# Start API Server
+echo "🔌 Starting API Server (http://localhost:8000)..."
+echo ""
+uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload &
+API_PID=$!
+
+echo "✅ All services started!"
+echo "Press Ctrl+C to stop"
+echo ""
+
+# Handle Ctrl+C
+trap "kill $PRODUCER_PID $SPARK_PID $API_PID 2>/dev/null; echo ''; echo '🛑 All services stopped'; exit 0" INT
+
+# Wait for all processes
+wait

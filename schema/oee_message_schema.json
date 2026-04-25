@@ -18,6 +18,9 @@
     "loss_event":    { "type": "object" },
     "lot_id":        { "type": "string" },
     "recipe_name":   { "type": "string" },
-    "chamber_id":    { "type": "string" }
+    "chamber_id":    { "type": "string" },
+    "wph":           { "type": "number", "minimum": 0 },
+    "mttr_minutes":  { "type": "number", "minimum": 0 },
+    "mtbf_minutes":  { "type": "number", "minimum": 0 }
   }
 }

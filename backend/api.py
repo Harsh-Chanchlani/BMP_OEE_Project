@@ -252,6 +252,136 @@ def acknowledge_alert(alert_id: int, token: dict = Depends(require_auth)):
     conn.commit(); cur.close(); conn.close()
     return {"acknowledged": True, "alert_id": alert_id}
 
+# --- New Analytics Endpoints ---
+@app.get("/api/oee/apq")
+def get_apq(machine: Optional[str] = Query(None), limit: int = Query(30), token: dict = Depends(require_auth)):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    if machine:
+        cur.execute("""
+            SELECT machine_id, window_start, window_end,
+                   avg_availability, avg_performance, avg_quality
+            FROM oee_data
+            WHERE machine_id = %s
+            ORDER BY window_start ASC
+            LIMIT %s;
+        """, (machine, limit))
+    else:
+        cur.execute("""
+            SELECT DISTINCT ON (machine_id)
+                machine_id, window_start, window_end,
+                avg_availability, avg_performance, avg_quality
+            FROM oee_data
+            ORDER BY machine_id, window_end DESC;
+        """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    for r in rows:
+        r["window_start"] = r["window_start"].isoformat()
+        r["window_end"]   = r["window_end"].isoformat()
+    return rows
+
+@app.get("/api/machines/compare")
+def get_machines_compare(token: dict = Depends(require_auth)):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT DISTINCT ON (machine_id)
+            machine_id, avg_oee, avg_availability, avg_performance, avg_quality, window_end
+        FROM oee_data
+        ORDER BY machine_id, window_end DESC;
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    for r in rows:
+        r["window_end"] = r["window_end"].isoformat()
+    rows.sort(key=lambda r: r["avg_oee"] if r["avg_oee"] is not None else 0)
+    return rows
+
+@app.get("/api/spc")
+def get_spc(machine: Optional[str] = Query(None), token: dict = Depends(require_auth)):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    if machine:
+        cur.execute("""
+            SELECT machine_id, mean_value, std_dev, ucl, lcl, sample_size, calculated_at
+            FROM spc_data
+            WHERE machine_id = %s AND metric = 'oee'
+            ORDER BY calculated_at DESC
+            LIMIT 1;
+        """, (machine,))
+    else:
+        cur.execute("""
+            SELECT DISTINCT ON (machine_id)
+                machine_id, mean_value, std_dev, ucl, lcl, sample_size, calculated_at
+            FROM spc_data
+            WHERE metric = 'oee'
+            ORDER BY machine_id, calculated_at DESC;
+        """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    for r in rows:
+        r["calculated_at"] = r["calculated_at"].isoformat()
+    return rows
+
+@app.get("/api/shifts")
+def get_shifts(
+    machine: Optional[str] = Query(None),
+    days: int = Query(7),
+    token: dict = Depends(require_auth),
+):
+    days = min(days, 30)
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    if machine:
+        cur.execute("""
+            SELECT machine_id, shift_date, shift, avg_oee, avg_availability,
+                   avg_performance, avg_quality, min_oee, max_oee, data_points
+            FROM shift_performance
+            WHERE machine_id = %s
+              AND shift_date >= CURRENT_DATE - INTERVAL '%s days'
+            ORDER BY shift_date DESC, shift ASC;
+        """, (machine, days))
+    else:
+        cur.execute("""
+            SELECT DISTINCT ON (machine_id, shift)
+                machine_id, shift_date, shift, avg_oee, avg_availability,
+                avg_performance, avg_quality, min_oee, max_oee, data_points
+            FROM shift_performance
+            WHERE shift_date >= CURRENT_DATE - INTERVAL '%s days'
+            ORDER BY machine_id, shift, shift_date DESC;
+        """, (days,))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    for r in rows:
+        r["shift_date"] = r["shift_date"].isoformat()
+    return rows
+
+@app.get("/api/losses")
+def get_losses(machine: Optional[str] = Query(None), token: dict = Depends(require_auth)):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    if machine:
+        cur.execute("""
+            SELECT loss_type, loss_component,
+                   SUM(loss_percentage) AS total_loss_percentage
+            FROM loss_categories
+            WHERE machine_id = %s
+            GROUP BY loss_type, loss_component
+            ORDER BY total_loss_percentage DESC;
+        """, (machine,))
+    else:
+        cur.execute("""
+            SELECT loss_type, loss_component,
+                   SUM(loss_percentage) AS total_loss_percentage
+            FROM loss_categories
+            GROUP BY loss_type, loss_component
+            ORDER BY total_loss_percentage DESC;
+        """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
+
 # --- WebSocket Endpoints ---
 @app.websocket("/ws/oee")
 async def websocket_oee(websocket: WebSocket):
@@ -274,10 +404,10 @@ async def websocket_oee(websocket: WebSocket):
                 conn = get_conn()
                 cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                 cur.execute("""
-                    SELECT DISTINCT ON (machine_id)
-                        machine_id, window_start, window_end, avg_oee
+                    SELECT machine_id, window_start, window_end, avg_oee
                     FROM oee_data
-                    ORDER BY machine_id, window_end DESC;
+                    WHERE window_start >= NOW() - INTERVAL '30 minutes'
+                    ORDER BY machine_id, window_end ASC;
                 """)
                 rows = [dict(r) for r in cur.fetchall()]
                 cur.close(); conn.close()

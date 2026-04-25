@@ -9,7 +9,9 @@ import os
 import sys
 import json
 import uuid
+import statistics
 import psycopg2
+import psycopg2.extras
 from datetime import datetime
 from confluent_kafka import Producer as ConfluentProducer
 
@@ -58,8 +60,8 @@ SASL_USER   = os.getenv("KAFKA_SASL_USERNAME", "")
 SASL_PASS   = os.getenv("KAFKA_SASL_PASSWORD", "")
 TOPIC       = os.getenv("OEE_TOPIC",   "OEE_0")
 ALERT_TOPIC = os.getenv("ALERT_TOPIC", "OEE_ALERTS")
-WARN_THR    = float(os.getenv("OEE_WARNING_THRESHOLD",  "70.0"))
-CRIT_THR    = float(os.getenv("OEE_CRITICAL_THRESHOLD", "55.0"))
+WARN_THR    = float(os.getenv("OEE_WARNING_THRESHOLD",  "55.0"))
+CRIT_THR    = float(os.getenv("OEE_CRITICAL_THRESHOLD", "40.0"))
 
 DB_CONF = dict(
     dbname   = os.getenv("PGDATABASE", "oee_db"),
@@ -141,6 +143,12 @@ msg_schema = StructType([
     StructField("lot_id",       StringType()),
     StructField("recipe_name",  StringType()),
     StructField("chamber_id",   StringType()),
+    StructField("shift",        StringType()),
+    StructField("wph",          DoubleType()),
+    StructField("loss_event",   StructType([
+        StructField("name",      StringType()),
+        StructField("component", StringType()),
+    ])),
 ])
 
 parsed = (
@@ -166,6 +174,182 @@ windowed = (
         avg("quality").alias("avg_quality"),
     )
 )
+
+# ── Loss categories upsert ────────────────────────────────────────────────────
+# Maps loss event component → Six Big Losses category
+_LOSS_TYPE_MAP = {
+    "availability": "Equipment Failure",
+    "performance":  "Reduced Speed",
+    "quality":      "Process Defects",
+}
+
+def _upsert_loss_categories(conn, raw_rows):
+    """Write loss events from raw Kafka rows into loss_categories table."""
+    cur = conn.cursor()
+    for row in raw_rows:
+        try:
+            if not row.loss_event or not row.loss_event.name:
+                continue
+            component  = row.loss_event.component or "availability"
+            loss_type  = _LOSS_TYPE_MAP.get(component, "Equipment Failure")
+            # Estimate loss_percentage as the deviation from 100 on the affected component
+            if component == "availability":
+                loss_pct = round(max(0, 100 - (row.availability or 0)), 2)
+            elif component == "performance":
+                loss_pct = round(max(0, 100 - (row.performance or 0)), 2)
+            else:
+                loss_pct = round(max(0, 100 - (row.quality or 0)), 2)
+            ts = datetime.utcfromtimestamp(row.timestamp) if row.timestamp else datetime.utcnow()
+            cur.execute("""
+                INSERT INTO loss_categories
+                  (machine_id, timestamp, loss_type, loss_component, loss_percentage, description)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (row.machine_id, ts, loss_type, component, loss_pct, row.loss_event.name))
+        except Exception as e:
+            print(f"[WARN] _upsert_loss_categories failed for row: {e}")
+
+
+# ── Shift helper ─────────────────────────────────────────────────────────────
+def _shift_for_hour(h: int) -> str:
+    if 6 <= h <= 13:  return "morning"
+    if 14 <= h <= 21: return "afternoon"
+    return "night"
+
+
+# ── Shift performance upsert ──────────────────────────────────────────────────
+def _upsert_shift_performance(conn, rows):
+    """Aggregate OEE rows by (machine_id, shift_date, shift) and upsert into shift_performance."""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for row in rows:
+        shift_date = row.window.start.date()
+        shift = _shift_for_hour(row.window.start.hour)
+        key = (row.machine_id, shift_date, shift)
+        groups[key].append(row.avg_oee)
+
+    cur = conn.cursor()
+    for (machine_id, shift_date, shift), oee_values in groups.items():
+        valid = [v for v in oee_values if v is not None]
+        if not valid:
+            continue
+        avg_oee = round(statistics.mean(valid), 4)
+        min_oee = round(min(valid), 4)
+        max_oee = round(max(valid), 4)
+        data_points = len(valid)
+
+        # Gather APQ values for the same group
+        apq_rows = [r for r in rows
+                    if r.machine_id == machine_id
+                    and r.window.start.date() == shift_date
+                    and _shift_for_hour(r.window.start.hour) == shift]
+        avg_avail = round(statistics.mean([r.avg_availability for r in apq_rows if r.avg_availability is not None] or [0]), 4)
+        avg_perf  = round(statistics.mean([r.avg_performance  for r in apq_rows if r.avg_performance  is not None] or [0]), 4)
+        avg_qual  = round(statistics.mean([r.avg_quality      for r in apq_rows if r.avg_quality      is not None] or [0]), 4)
+
+        cur.execute("""
+            INSERT INTO shift_performance
+              (machine_id, shift_date, shift, avg_oee, avg_availability,
+               avg_performance, avg_quality, min_oee, max_oee, data_points)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (machine_id, shift_date, shift) DO UPDATE SET
+                avg_oee          = EXCLUDED.avg_oee,
+                avg_availability = EXCLUDED.avg_availability,
+                avg_performance  = EXCLUDED.avg_performance,
+                avg_quality      = EXCLUDED.avg_quality,
+                min_oee          = EXCLUDED.min_oee,
+                max_oee          = EXCLUDED.max_oee,
+                data_points      = EXCLUDED.data_points
+        """, (machine_id, shift_date, shift, avg_oee, avg_avail,
+              avg_perf, avg_qual, min_oee, max_oee, data_points))
+
+
+# ── SPC computation ───────────────────────────────────────────────────────────
+def _compute_spc(conn, machine_id, batch_ts):
+    """Compute SPC statistics for a machine using last 24h of oee_data."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT avg_oee FROM oee_data
+            WHERE machine_id = %s
+              AND window_start >= NOW() - INTERVAL '24 hours'
+            ORDER BY window_start;
+        """, (machine_id,))
+        values = [r[0] for r in cur.fetchall() if r[0] is not None]
+        if len(values) < 10:
+            return
+        mean = statistics.mean(values)
+        std  = statistics.stdev(values)
+        ucl  = mean + 3 * std
+        lcl  = mean - 3 * std
+        cur.execute("""
+            INSERT INTO spc_data
+              (machine_id, calculated_at, metric, mean_value, std_dev, ucl, lcl, sample_size)
+            VALUES (%s, %s, 'oee', %s, %s, %s, %s, %s)
+        """, (machine_id, batch_ts, round(mean, 4), round(std, 4),
+              round(ucl, 4), round(lcl, 4), len(values)))
+    except Exception as e:
+        print(f"[WARN] _compute_spc failed for {machine_id}: {e}")
+
+
+# ── Anomaly detection ─────────────────────────────────────────────────────────
+def _detect_anomalies(conn, rows, ap):
+    """Detect OEE anomalies (> 2 std below mean) and insert alerts + publish to Kafka."""
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    for row in rows:
+        try:
+            cur.execute("""
+                SELECT mean_value, std_dev FROM spc_data
+                WHERE machine_id = %s AND metric = 'oee'
+                ORDER BY calculated_at DESC LIMIT 1;
+            """, (row.machine_id,))
+            spc = cur.fetchone()
+            if not spc:
+                continue
+            threshold = spc["mean_value"] - 2 * spc["std_dev"]
+            if row.avg_oee < threshold:
+                msg = (f"ANOMALY: {row.machine_id} OEE={round(row.avg_oee,2)} "
+                       f"< mean({round(spc['mean_value'],2)}) - 2*std({round(spc['std_dev'],2)})")
+                cur2 = conn.cursor()
+                cur2.execute("""
+                    INSERT INTO oee_alerts
+                      (machine_id, avg_oee, threshold, window_start, window_end, alert_level)
+                    VALUES (%s, %s, %s, %s, %s, 'ANOMALY')
+                """, (row.machine_id, round(row.avg_oee, 4), round(threshold, 4),
+                      row.window.start, row.window.end))
+                if ap:
+                    payload = {
+                        "machine_id":   row.machine_id,
+                        "avg_oee":      round(row.avg_oee, 2),
+                        "threshold":    round(threshold, 2),
+                        "alert_level":  "ANOMALY",
+                        "window_start": row.window.start.isoformat(),
+                        "window_end":   row.window.end.isoformat(),
+                        "alert_id":     str(uuid.uuid4()),
+                    }
+                    try:
+                        ap.produce(ALERT_TOPIC, value=json.dumps(payload).encode())
+                        ap.poll(0)
+                    except Exception as e:
+                        print(f"[WARN] Anomaly alert produce failed: {e}")
+        except Exception as e:
+            print(f"[WARN] _detect_anomalies failed for {row.machine_id}: {e}")
+
+
+# ── Raw batch writer: loss categories ────────────────────────────────────────
+def write_raw_batch(batch_df, batch_id):
+    """Write loss events from raw parsed messages into loss_categories."""
+    rows = batch_df.collect()
+    if not rows:
+        return
+    conn = psycopg2.connect(**DB_CONF)
+    try:
+        _upsert_loss_categories(conn, rows)
+        conn.commit()
+    except Exception as e:
+        print(f"[WARN] write_raw_batch error: {e}")
+    finally:
+        conn.close()
+
 
 # ── Batch writer: Postgres + Alerts ──────────────────────────────────────────
 def write_batch(batch_df, batch_id):
@@ -235,6 +419,16 @@ def write_batch(batch_df, batch_id):
                     print(f"[WARN] Alert produce failed: {e}")
 
     conn.commit()
+
+    # ── Analytics helpers ─────────────────────────────────────────────────────
+    batch_ts = datetime.utcnow()
+    machine_ids = {row.machine_id for row in rows if isinstance(row.machine_id, str) and row.machine_id}
+    for machine_id in machine_ids:
+        _compute_spc(conn, machine_id, batch_ts)
+    _upsert_shift_performance(conn, rows)
+    _detect_anomalies(conn, rows, alert_producer)
+    conn.commit()
+
     cur.close()
     conn.close()
 
@@ -283,6 +477,16 @@ query = (
     .foreachBatch(write_batch)
     .trigger(processingTime="10 seconds")
     .option("checkpointLocation", "/tmp/oee_spark_checkpoint")
+    .start()
+)
+
+# Second stream: raw messages → loss_categories
+raw_query = (
+    parsed.writeStream
+    .outputMode("append")
+    .foreachBatch(write_raw_batch)
+    .trigger(processingTime="10 seconds")
+    .option("checkpointLocation", "/tmp/oee_spark_raw_checkpoint")
     .start()
 )
 
