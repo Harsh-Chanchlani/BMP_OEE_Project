@@ -11,7 +11,9 @@ from datetime import datetime
 from typing import Set, List, Optional
 import boto3
 
-def load_env_file(path=".env"):
+def load_env_file(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "..", ".env")
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8") as file:
@@ -24,6 +26,8 @@ def load_env_file(path=".env"):
 
 load_env_file()
 
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
 from auth import verify_password, create_access_token, decode_access_token
 
 app = FastAPI(title="BMP OEE API")
@@ -89,6 +93,31 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # --- Auth Endpoints ---
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/auth/register", status_code=201)
+def register(req: RegisterRequest):
+    from auth import hash_password
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO api_users (username, hashed_password, role) VALUES (%s, %s, 'viewer')",
+            (req.username, hash_password(req.password))
+        )
+        conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="Username already exists")
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+    finally:
+        cur.close(); conn.close()
+    return {"message": "User created successfully"}
+
 @app.post("/api/auth/token", response_model=Token)
 def login(form: OAuth2PasswordRequestForm = Depends()):
     conn = get_conn()
@@ -165,7 +194,7 @@ def get_stats(machine: str = Query(...), token: dict = Depends(require_auth)):
             COUNT(*)      AS total_windows
         FROM oee_data
         WHERE machine_id = %s
-          AND window_start >= NOW() - INTERVAL '15 minutes';
+          AND window_start >= NOW() - INTERVAL '24 hours';
     """, (machine,))
     row = cur.fetchone()
     cur.close(); conn.close()

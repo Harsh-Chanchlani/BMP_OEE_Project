@@ -3,10 +3,10 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceLine, AreaChart, Area,
 } from "recharts";
+import { login, logout, register, getToken, authHeader } from "./api/auth";
 
 const API = "http://localhost:8000";
 
-// ── OEE threshold helper ──
 function getThreshold(value) {
   if (value >= 85) return { label: "WORLD CLASS", color: "#00ff87", bg: "rgba(0,255,135,0.1)" };
   if (value >= 75) return { label: "GOOD",        color: "#f5c518", bg: "rgba(245,197,24,0.1)" };
@@ -14,7 +14,103 @@ function getThreshold(value) {
   return              { label: "POOR",             color: "#ff4757", bg: "rgba(255,71,87,0.1)" };
 }
 
-// ── Gauge Arc SVG ──
+// ── Login Screen ──────────────────────────────────────────────────────────────
+function LoginScreen({ onLogin }) {
+  const [mode, setMode]         = useState("login"); // "login" | "signup"
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm]   = useState("");
+  const [error, setError]       = useState("");
+  const [success, setSuccess]   = useState("");
+  const [loading, setLoading]   = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError(""); setSuccess("");
+    if (mode === "signup" && password !== confirm) {
+      setError("Passwords do not match"); return;
+    }
+    setLoading(true);
+    try {
+      if (mode === "signup") {
+        await register(username, password);
+        setSuccess("Account created! Signing you in...");
+      }
+      await login(username, password);
+      onLogin();
+    } catch (err) {
+      setError(err.message || "Something went wrong");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const switchMode = () => {
+    setMode(mode === "login" ? "signup" : "login");
+    setError(""); setSuccess(""); setPassword(""); setConfirm("");
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#080b10", display: "flex",
+      alignItems: "center", justifyContent: "center", fontFamily: "'Courier New', monospace" }}>
+      <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(0,255,135,0.2)",
+        borderRadius: 16, padding: "40px 48px", width: 360, display: "flex",
+        flexDirection: "column", gap: 24 }}>
+        <div>
+          <div style={{ color: "#00ff87", fontSize: 20, fontWeight: 800, letterSpacing: "3px" }}>⬡ OEE MONITOR</div>
+          <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: "2px", marginTop: 4 }}>
+            {mode === "login" ? "SIGN IN TO CONTINUE" : "CREATE AN ACCOUNT"}
+          </div>
+        </div>
+
+        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <input
+            type="text" placeholder="Username" value={username}
+            onChange={(e) => setUsername(e.target.value)} required
+            style={inputStyle}
+          />
+          <input
+            type="password" placeholder="Password" value={password}
+            onChange={(e) => setPassword(e.target.value)} required
+            style={inputStyle}
+          />
+          {mode === "signup" && (
+            <input
+              type="password" placeholder="Confirm Password" value={confirm}
+              onChange={(e) => setConfirm(e.target.value)} required
+              style={inputStyle}
+            />
+          )}
+          {error   && <div style={{ color: "#ff4757", fontSize: 11, letterSpacing: "1px" }}>⚠ {error}</div>}
+          {success && <div style={{ color: "#00ff87", fontSize: 11, letterSpacing: "1px" }}>✓ {success}</div>}
+          <button type="submit" disabled={loading}
+            style={{ background: loading ? "rgba(0,255,135,0.1)" : "rgba(0,255,135,0.15)",
+              border: "1px solid rgba(0,255,135,0.4)", color: "#00ff87", padding: "10px",
+              borderRadius: 8, fontFamily: "monospace", fontSize: 13, fontWeight: 700,
+              letterSpacing: "2px", cursor: loading ? "not-allowed" : "pointer" }}>
+            {loading ? "PLEASE WAIT..." : mode === "login" ? "SIGN IN" : "SIGN UP"}
+          </button>
+        </form>
+
+        <div style={{ textAlign: "center", fontSize: 11, color: "rgba(255,255,255,0.3)" }}>
+          {mode === "login" ? "Don't have an account?" : "Already have an account?"}{" "}
+          <span onClick={switchMode}
+            style={{ color: "#00ff87", cursor: "pointer", textDecoration: "underline" }}>
+            {mode === "login" ? "Sign up" : "Sign in"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const inputStyle = {
+  background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)",
+  borderRadius: 8, padding: "10px 14px", color: "#e8eaf0", fontFamily: "monospace",
+  fontSize: 13, outline: "none", width: "100%", boxSizing: "border-box",
+};
+
+// ── Sub-components ────────────────────────────────────────────────────────────
 function GaugeArc({ value, size = 140 }) {
   const r = 46, cx = size / 2, cy = size / 2 + 10;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -28,7 +124,7 @@ function GaugeArc({ value, size = 140 }) {
   const { color } = getThreshold(value);
   return (
     <svg width={size} height={size} style={{ overflow: "visible" }}>
-      <path d={arc(start, end)}   fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="8" strokeLinecap="round" />
+      <path d={arc(start, end)}    fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="8" strokeLinecap="round" />
       <path d={arc(start, filled)} fill="none" stroke={color} strokeWidth="8" strokeLinecap="round"
         style={{ filter: `drop-shadow(0 0 6px ${color})` }} />
       <text x={cx} y={cy + 4}  textAnchor="middle" fill={color} fontSize="18" fontWeight="800" fontFamily="'Courier New', monospace">
@@ -85,40 +181,41 @@ const CustomTooltip = ({ active, payload, label }) => {
   );
 };
 
-export default function OEEDashboard() {
-  const [machines, setMachines]   = useState([]);
-  const [machine, setMachine]     = useState("");
-  const [history, setHistory]     = useState([]);
-  const [latest, setLatest]       = useState(null);
-  const [stats, setStats]         = useState(null);
-  const [alerts, setAlerts]       = useState([]);
-  const [loading, setLoading]     = useState(true);
-  const [error, setError]         = useState(null);
+// ── Main Dashboard ────────────────────────────────────────────────────────────
+function Dashboard() {
+  const [machines, setMachines]       = useState([]);
+  const [machine, setMachine]         = useState("");
+  const [history, setHistory]         = useState([]);
+  const [latest, setLatest]           = useState(null);
+  const [stats, setStats]             = useState(null);
+  const [alerts, setAlerts]           = useState([]);
+  const [loading, setLoading]         = useState(true);
+  const [error, setError]             = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
 
-  // ── Fetch machine list once on mount ──
+  // fetch machine list once
   useEffect(() => {
-    fetch(`${API}/api/machines`)
-      .then((r) => r.json())
+    fetch(`${API}/api/machines`, { headers: authHeader() })
+      .then((r) => {
+        if (r.status === 401) { logout(); return []; }
+        return r.json();
+      })
       .then((list) => {
         setMachines(list);
         if (list.length > 0) setMachine(list[0]);
       })
-      .catch(() => setError("Cannot reach API. Is api.py running on port 8000?"));
+      .catch(() => setError("Cannot reach API on port 8000"));
   }, []);
 
-  // ── Fetch data for selected machine ──
   const fetchData = useCallback(() => {
     if (!machine) return;
     setError(null);
-
     Promise.all([
-      fetch(`${API}/api/oee/history?machine=${machine}&limit=30`).then((r) => r.json()),
-      fetch(`${API}/api/oee/latest?machine=${machine}`).then((r) => r.json()),
-      fetch(`${API}/api/oee/stats?machine=${machine}`).then((r) => r.json()),
+      fetch(`${API}/api/oee/history?machine=${machine}&limit=30`, { headers: authHeader() }).then((r) => r.json()),
+      fetch(`${API}/api/oee/latest?machine=${machine}`,           { headers: authHeader() }).then((r) => r.json()),
+      fetch(`${API}/api/oee/stats?machine=${machine}`,            { headers: authHeader() }).then((r) => r.json()),
     ])
       .then(([hist, lat, st]) => {
-        // Format history for chart
         const formatted = hist.map((row) => ({
           time: new Date(row.window_start).toLocaleTimeString(),
           oee: parseFloat(Number(row.avg_oee).toFixed(2)),
@@ -130,8 +227,6 @@ export default function OEEDashboard() {
         setStats(st);
         setLastRefresh(new Date().toLocaleTimeString());
         setLoading(false);
-
-        // Alert if latest OEE is below threshold
         if (lat?.avg_oee && lat.avg_oee < 75) {
           const sev = lat.avg_oee < 65 ? "crit" : "warn";
           setAlerts((prev) => [
@@ -141,13 +236,9 @@ export default function OEEDashboard() {
           ]);
         }
       })
-      .catch(() => {
-        setError("Failed to fetch data. Check your Postgres connection and api.py.");
-        setLoading(false);
-      });
+      .catch(() => { setError("Failed to fetch data."); setLoading(false); });
   }, [machine]);
 
-  // ── Poll every 10 seconds ──
   useEffect(() => {
     if (!machine) return;
     setLoading(true);
@@ -156,26 +247,25 @@ export default function OEEDashboard() {
     return () => clearInterval(id);
   }, [fetchData, machine]);
 
-  const current  = latest  || {};
-  const oeeVal   = Number(current.avg_oee  || 0);
-  const avg15    = Number(stats?.avg_oee   || 0);
-  const minOEE   = Number(stats?.min_oee   || 0);
-  const maxOEE   = Number(stats?.max_oee   || 0);
-  const thresh   = getThreshold(oeeVal);
+  const current = latest || {};
+  const oeeVal  = Number(current.avg_oee || 0);
+  const avg15   = Number(stats?.avg_oee  || 0);
+  const minOEE  = Number(stats?.min_oee  || 0);
+  const maxOEE  = Number(stats?.max_oee  || 0);
+  const thresh  = getThreshold(oeeVal);
 
   return (
     <div style={{ minHeight: "100vh", background: "#080b10", color: "#e8eaf0",
       fontFamily: "'Courier New', monospace", padding: 0 }}>
-
       <style>{`
-        @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+        @keyframes pulse   { 0%,100%{opacity:1}50%{opacity:0.3} }
         @keyframes slideIn { from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1} }
-        @keyframes spin { from{transform:rotate(0deg)}to{transform:rotate(360deg)} }
+        @keyframes spin    { from{transform:rotate(0deg)}to{transform:rotate(360deg)} }
         ::-webkit-scrollbar{width:4px;height:4px}
         ::-webkit-scrollbar-thumb{background:rgba(0,255,135,0.2);border-radius:2px}
       `}</style>
 
-      {/* ── Top Bar ── */}
+      {/* Top Bar */}
       <div style={{ background: "rgba(0,0,0,0.6)", borderBottom: "1px solid rgba(0,255,135,0.15)",
         padding: "12px 32px", display: "flex", alignItems: "center", justifyContent: "space-between",
         backdropFilter: "blur(10px)", position: "sticky", top: 0, zIndex: 100 }}>
@@ -184,11 +274,7 @@ export default function OEEDashboard() {
           <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: "2px" }}>KAFKA → SPARK → POSTGRES → REACT</div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-          {lastRefresh && (
-            <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 10 }}>
-              Last: {lastRefresh}
-            </span>
-          )}
+          {lastRefresh && <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 10 }}>Last: {lastRefresh}</span>}
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div style={{ width: 7, height: 7, borderRadius: "50%", background: error ? "#ff4757" : "#00ff87",
               boxShadow: `0 0 8px ${error ? "#ff4757" : "#00ff87"}`, animation: "pulse 1.5s infinite" }} />
@@ -202,19 +288,20 @@ export default function OEEDashboard() {
               fontSize: 12, cursor: "pointer", outline: "none" }}>
             {machines.map((m) => <option key={m} value={m} style={{ background: "#0d1117" }}>{m}</option>)}
           </select>
+          <button onClick={logout}
+            style={{ background: "transparent", border: "1px solid rgba(255,71,87,0.3)", color: "#ff4757",
+              padding: "5px 12px", borderRadius: 6, fontFamily: "monospace", fontSize: 10,
+              letterSpacing: "1px", cursor: "pointer" }}>LOGOUT</button>
         </div>
       </div>
 
-      {/* ── Error Banner ── */}
       {error && (
         <div style={{ background: "rgba(255,71,87,0.1)", border: "1px solid rgba(255,71,87,0.4)",
-          margin: "16px 32px", padding: "12px 20px", borderRadius: 8, color: "#ff4757",
-          fontSize: 12, letterSpacing: "1px" }}>
+          margin: "16px 32px", padding: "12px 20px", borderRadius: 8, color: "#ff4757", fontSize: 12 }}>
           ⚠ {error}
         </div>
       )}
 
-      {/* ── Loading spinner ── */}
       {loading && !error && (
         <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: 200 }}>
           <div style={{ width: 32, height: 32, border: "3px solid rgba(0,255,135,0.1)",
@@ -225,7 +312,7 @@ export default function OEEDashboard() {
       {!loading && (
         <div style={{ padding: "24px 32px", display: "flex", flexDirection: "column", gap: 24 }}>
 
-          {/* ── Row 1: Gauge + KPIs ── */}
+          {/* Row 1: Gauge + KPIs */}
           <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 20 }}>
             <div style={{ background: "rgba(255,255,255,0.02)", border: `1px solid ${thresh.color}30`,
               borderRadius: 16, padding: 24, display: "flex", flexDirection: "column",
@@ -235,13 +322,12 @@ export default function OEEDashboard() {
               <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: "3px" }}>CURRENT OEE</div>
               <GaugeArc value={oeeVal} size={140} />
               <StatusBadge value={oeeVal} />
-              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: "1px", textAlign: "center" }}>
+              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, textAlign: "center" }}>
                 {current.window_end
                   ? `Window end: ${new Date(current.window_end).toLocaleTimeString()}`
                   : "No data yet"}
               </div>
             </div>
-
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: "1fr 1fr", gap: 12 }}>
               <StatCard label="Latest OEE"    value={oeeVal}  color="#00ff87" icon="◈" sub={`Machine: ${machine}`} />
               <StatCard label="15-min Avg"    value={avg15}   color="#f59e0b" icon="∿" sub="Last 15 minutes" />
@@ -252,24 +338,22 @@ export default function OEEDashboard() {
             </div>
           </div>
 
-          {/* ── Row 2: OEE Trend ── */}
+          {/* Row 2: OEE Trend */}
           <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
             borderRadius: 16, padding: "20px 24px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
               <div>
                 <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "2px", color: "rgba(255,255,255,0.8)" }}>OEE TREND</div>
                 <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>
-                  Real data · Spark 1-min sliding windows · 30s slide
+                  Spark 1-min sliding windows · 30s slide
                 </div>
               </div>
-              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", letterSpacing: "1px" }}>
-                {history.length} POINTS
-              </span>
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)" }}>{history.length} POINTS</span>
             </div>
             {history.length === 0 ? (
               <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center",
                 color: "rgba(255,255,255,0.2)", fontSize: 12 }}>
-                No history data yet — start your Producer.py and Spark job
+                No history yet — Spark job needs to be running
               </div>
             ) : (
               <ResponsiveContainer width="100%" height={200}>
@@ -291,20 +375,16 @@ export default function OEEDashboard() {
             )}
           </div>
 
-          {/* ── Row 3: Table + Alerts ── */}
+          {/* Row 3: Table + Alerts */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 20 }}>
-            {/* Table */}
             <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
               borderRadius: 16, overflow: "hidden" }}>
-              <div style={{ padding: "16px 24px", borderBottom: "1px solid rgba(255,255,255,0.05)",
-                display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "2px", color: "rgba(255,255,255,0.8)" }}>
-                    WINDOW AGGREGATES
-                  </div>
-                  <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>
-                    Live from oee_data · Spark micro-batches
-                  </div>
+              <div style={{ padding: "16px 24px", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "2px", color: "rgba(255,255,255,0.8)" }}>
+                  WINDOW AGGREGATES
+                </div>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>
+                  Live from oee_data · Spark micro-batches
                 </div>
               </div>
               <div style={{ overflowX: "auto" }}>
@@ -344,7 +424,6 @@ export default function OEEDashboard() {
               </div>
             </div>
 
-            {/* Alerts + sparkline */}
             <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
               borderRadius: 16, overflow: "hidden", display: "flex", flexDirection: "column" }}>
               <div style={{ padding: "16px 20px", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
@@ -365,7 +444,7 @@ export default function OEEDashboard() {
                       {a.sev === "crit" ? "⚠ CRITICAL" : "△ WARNING"}
                     </div>
                     <div style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", marginTop: 2 }}>{a.msg}</div>
-                    <div style={{ fontSize: 9,  color: "rgba(255,255,255,0.2)", marginTop: 3 }}>{a.time}</div>
+                    <div style={{ fontSize: 9, color: "rgba(255,255,255,0.2)", marginTop: 3 }}>{a.time}</div>
                   </div>
                 ))}
               </div>
@@ -392,4 +471,11 @@ export default function OEEDashboard() {
       )}
     </div>
   );
+}
+
+// ── Root: gate on auth ────────────────────────────────────────────────────────
+export default function App() {
+  const [authed, setAuthed] = useState(!!getToken());
+  if (!authed) return <LoginScreen onLogin={() => setAuthed(true)} />;
+  return <Dashboard />;
 }

@@ -9,7 +9,9 @@ import uuid
 from datetime import datetime
 from confluent_kafka import Producer as ConfluentProducer
 
-def load_env_file(path):
+def load_env_file(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "..", ".env")
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8") as file:
@@ -20,7 +22,9 @@ def load_env_file(path):
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
 
-def load_kafka_properties(path):
+def load_kafka_properties(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "..", "ccloud-python-client", "client.properties")
     if not os.path.exists(path):
         return
     props = {}
@@ -40,8 +44,8 @@ def load_kafka_properties(path):
         if src_key in props:
             os.environ.setdefault(env_key, props[src_key])
 
-load_env_file(".env")
-load_kafka_properties("ccloud-python-client/client.properties")
+load_env_file()
+load_kafka_properties()
 
 # DB Config
 DB_NAME = os.getenv("PGDATABASE", "oee_db")

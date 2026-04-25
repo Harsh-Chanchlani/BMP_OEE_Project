@@ -1,5 +1,18 @@
 const BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
+export async function register(username, password) {
+  const res = await fetch(`${BASE}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.detail || "Registration failed");
+  }
+  return true;
+}
+
 export async function login(username, password) {
   const form = new URLSearchParams({ username, password });
   const res = await fetch(`${BASE}/api/auth/token`, {

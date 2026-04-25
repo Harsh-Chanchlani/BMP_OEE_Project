@@ -5,7 +5,9 @@ from datetime import datetime
 import base64
 from confluent_kafka import Producer
 
-def load_env_file(path=".env"):
+def load_env_file(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "..", ".env")
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8") as file:
@@ -16,7 +18,9 @@ def load_env_file(path=".env"):
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
 
-def load_kafka_properties(path="ccloud-python-client/client.properties"):
+def load_kafka_properties(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "..", "ccloud-python-client", "client.properties")
     if not os.path.exists(path):
         return
     props = {}

@@ -17,7 +17,7 @@ def load_env_file(path=".env"):
 load_env_file()
 
 # Add parent directory to path to import auth
-sys.path.insert(0, os.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'backend')))
 from auth import hash_password
 
 def main():

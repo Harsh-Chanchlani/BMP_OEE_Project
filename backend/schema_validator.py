@@ -8,7 +8,7 @@ class SchemaValidationError(Exception):
         self.raw = raw
 
 def load_schema():
-    schema_path = os.path.join(os.path.dirname(__file__), "schema", "oee_message_schema.json")
+    schema_path = os.path.join(os.path.dirname(__file__), "..", "schema", "oee_message_schema.json")
     with open(schema_path, "r") as f:
         return json.load(f)
 
