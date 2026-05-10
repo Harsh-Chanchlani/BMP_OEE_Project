@@ -292,16 +292,21 @@ def _compute_spc(conn, machine_id, batch_ts):
 
 
 # ── Anomaly detection ─────────────────────────────────────────────────────────
-def _detect_anomalies(conn, rows, ap):
-    """Detect OEE anomalies (> 2 std below mean) and insert alerts + publish to Kafka."""
+def _detect_anomalies(conn, rows, ap, batch_ts):
+    """Detect OEE anomalies (> 2 std below mean) and insert alerts + publish to Kafka.
+    
+    Uses SPC statistics calculated strictly before batch_ts to avoid circular dependency
+    where _compute_spc contaminates the mean with the current batch's data.
+    """
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     for row in rows:
         try:
             cur.execute("""
                 SELECT mean_value, std_dev FROM spc_data
                 WHERE machine_id = %s AND metric = 'oee'
+                  AND calculated_at < %s
                 ORDER BY calculated_at DESC LIMIT 1;
-            """, (row.machine_id,))
+            """, (row.machine_id, batch_ts))
             spc = cur.fetchone()
             if not spc:
                 continue
@@ -335,20 +340,58 @@ def _detect_anomalies(conn, rows, ap):
             print(f"[WARN] _detect_anomalies failed for {row.machine_id}: {e}")
 
 
-# ── Raw batch writer: loss categories ────────────────────────────────────────
+# ── Raw batch writer: loss categories + raw OEE events ───────────────────────
 def write_raw_batch(batch_df, batch_id):
-    """Write loss events from raw parsed messages into loss_categories."""
+    """Write raw OEE events and loss events from raw parsed messages."""
     rows = batch_df.collect()
     if not rows:
         return
     conn = psycopg2.connect(**DB_CONF)
     try:
         _upsert_loss_categories(conn, rows)
+        _insert_raw_oee_events(conn, rows)
         conn.commit()
     except Exception as e:
         print(f"[WARN] write_raw_batch error: {e}")
     finally:
         conn.close()
+
+
+def _insert_raw_oee_events(conn, raw_rows):
+    """Insert individual raw OEE readings into oee_raw_events for ML/ARIMA use."""
+    cur = conn.cursor()
+    for row in raw_rows:
+        try:
+            if not row.machine_id or row.oee is None:
+                continue
+            if not (0 <= row.oee <= 100):
+                continue
+            event_time = datetime.utcfromtimestamp(row.timestamp) if row.timestamp else datetime.utcnow()
+            loss_name = row.loss_event.name      if row.loss_event else None
+            loss_comp = row.loss_event.component if row.loss_event else None
+            cur.execute("""
+                INSERT INTO oee_raw_events
+                  (machine_id, event_time, oee, availability, performance, quality,
+                   lot_id, recipe_name, chamber_id, shift, wph,
+                   loss_event_name, loss_event_component, message_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (
+                row.machine_id, event_time,
+                round(row.oee, 4),
+                round(row.availability or 0, 4),
+                round(row.performance  or 0, 4),
+                round(row.quality      or 0, 4),
+                getattr(row, "lot_id",      None),
+                getattr(row, "recipe_name", None),
+                getattr(row, "chamber_id",  None),
+                getattr(row, "shift",       None),
+                getattr(row, "wph",         None),
+                loss_name, loss_comp,
+                getattr(row, "message_id",  None),
+            ))
+        except Exception as e:
+            print(f"[WARN] _insert_raw_oee_events failed for row: {e}")
 
 
 # ── Batch writer: Postgres + Alerts ──────────────────────────────────────────
@@ -426,7 +469,7 @@ def write_batch(batch_df, batch_id):
     for machine_id in machine_ids:
         _compute_spc(conn, machine_id, batch_ts)
     _upsert_shift_performance(conn, rows)
-    _detect_anomalies(conn, rows, alert_producer)
+    _detect_anomalies(conn, rows, alert_producer, batch_ts)
     conn.commit()
 
     cur.close()

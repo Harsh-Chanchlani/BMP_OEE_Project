@@ -425,6 +425,72 @@ async def websocket_oee(websocket: WebSocket):
     except (WebSocketDisconnect, asyncio.CancelledError):
         manager.disconnect(websocket)
 
+@app.get("/api/oee/raw")
+def get_raw_events(machine: str = Query(...), limit: int = Query(15), token: dict = Depends(require_auth)):
+    """Return raw per-event OEE readings for a machine (most recent, up to limit)."""
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT machine_id, event_time, oee, availability, performance, quality,
+               lot_id, loss_event_name, loss_event_component
+        FROM oee_raw_events
+        WHERE machine_id = %s
+        ORDER BY event_time DESC
+        LIMIT %s;
+    """, (machine, limit))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    for r in rows:
+        r["event_time"] = r["event_time"].isoformat()
+    # Return in ascending order for charting
+    return list(reversed(rows))
+
+
+@app.websocket("/ws/oee_raw")
+async def websocket_oee_raw(websocket: WebSocket):
+    """Stream raw individual OEE events (last 30 min) for real-time per-event plotting."""
+    await websocket.accept()
+    try:
+        try:
+            auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+            decode_access_token(auth_msg.get("token", ""))
+        except Exception:
+            await websocket.close(code=4003, reason="Invalid token")
+            return
+
+        PUSH_INTERVAL = float(os.getenv("WS_PUSH_INTERVAL_SECONDS", "5"))
+        while True:
+            await asyncio.sleep(PUSH_INTERVAL)
+
+            def fetch_raw():
+                conn = get_conn()
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute("""
+                    SELECT machine_id, event_time, oee, availability, performance, quality,
+                           lot_id, loss_event_name, loss_event_component
+                    FROM (
+                        SELECT *, ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY event_time DESC) AS rn
+                        FROM oee_raw_events
+                    ) ranked
+                    WHERE rn <= 15
+                    ORDER BY machine_id, event_time ASC;
+                """)
+                rows = [dict(r) for r in cur.fetchall()]
+                cur.close(); conn.close()
+                for r in rows:
+                    r["event_time"] = r["event_time"].isoformat()
+                return rows
+
+            rows = await asyncio.to_thread(fetch_raw)
+            await websocket.send_json({
+                "type": "oee_raw_update",
+                "data": rows,
+                "pushed_at": datetime.utcnow().isoformat()
+            })
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+
+
 @app.websocket("/ws/alerts")
 async def websocket_alerts(websocket: WebSocket):
     await websocket.accept()

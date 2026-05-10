@@ -186,3 +186,32 @@ CREATE INDEX IF NOT EXISTS idx_oee_alerts_machine_time
     ON oee_alerts (machine_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_oee_alerts_unacked
     ON oee_alerts (acknowledged) WHERE acknowledged = FALSE;
+
+-- ============================================
+-- RAW OEE EVENTS - Individual machine readings
+-- Stores every raw Kafka event for ML/ARIMA use
+-- ============================================
+CREATE TABLE IF NOT EXISTS oee_raw_events (
+  id            BIGSERIAL PRIMARY KEY,
+  machine_id    TEXT NOT NULL,
+  event_time    TIMESTAMP NOT NULL,
+  oee           DOUBLE PRECISION NOT NULL,
+  availability  DOUBLE PRECISION,
+  performance   DOUBLE PRECISION,
+  quality       DOUBLE PRECISION,
+  lot_id        TEXT,
+  recipe_name   TEXT,
+  chamber_id    TEXT,
+  shift         TEXT,
+  wph           DOUBLE PRECISION,
+  loss_event_name      TEXT,
+  loss_event_component TEXT,
+  message_id    TEXT,
+  created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_oee_raw_machine_time
+  ON oee_raw_events (machine_id, event_time DESC);
+
+CREATE INDEX IF NOT EXISTS idx_oee_raw_event_time
+  ON oee_raw_events (event_time DESC);
