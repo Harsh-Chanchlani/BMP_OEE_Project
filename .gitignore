@@ -8,6 +8,8 @@ __pycache__/
 
 # macOS
 .DS_Store
+.DS_Store?
+._*
 
 # Secrets / local credentials
 .env
@@ -28,10 +30,38 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Misc
-*.zip
-.cph/
-
 # Logs
 logs/
 *.log
+
+# Kiro IDE files
+.kiro/
+tasks.md
+
+# Vim swap files
+*.swp
+*.swo
+
+# Python test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Spark checkpoints & state
+spark-warehouse/
+checkpoint/
+derby.log
+metastore_db/
+
+# Archive (local reference only)
+_archive/
+
+# Misc
+*.zip
+.cph/
