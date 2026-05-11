@@ -1,27 +1,62 @@
 """
 OEE Spark Structured Streaming Processor
-Confluent Cloud → Spark → Postgres + Alert topic
+==========================================
+Confluent Cloud (Kafka) → PySpark → PostgreSQL
 
-PySpark 3.5.1 with spark-sql-kafka-0-10_2.12:3.5.1
+What this script does, step by step:
+  1. Reads raw OEE messages from Kafka topic OEE_0.
+  2. Parses and validates each message.
+  3. Runs TWO parallel Spark streaming queries:
+
+     Stream A — Raw events writer
+       Every 10 s: writes each individual message to oee_raw_events.
+       Also writes the active loss category to loss_categories.
+
+     Stream B — Windowed aggregation writer
+       Every 10 s: groups events into 1-minute windows (30 s slide),
+       computes avg A / P / Q / OEE per machine per window, then:
+         • Upserts into oee_data
+         • Fires WARNING / CRITICAL threshold alerts → oee_alerts + Kafka
+         • Computes SPC (mean ± 3σ) from last 24 h → spc_data
+         • Detects statistical anomalies (OEE < mean − 2σ) → oee_alerts
+         • Aggregates shift performance → shift_performance
+
+OEE Formula (Kennedy):
+  Availability = Run Time / Planned Production Time  × 100
+  Performance  = (Ideal Cycle Time × Total Pieces) / Run Time  × 100
+  Quality      = Good Pieces / Total Pieces  × 100
+  OEE          = (A × P × Q) / 10 000
+
+Note: The producer already computes A/P/Q/OEE from raw inputs.
+      Spark re-uses those values and averages them over the window.
+      The raw inputs (planned_time, downtime, pieces) are also stored
+      so OEE can be re-derived from first principles if needed.
 """
 
-import os
-import sys
 import json
-import uuid
+import os
 import statistics
+import uuid
+from datetime import datetime, timezone
+
+def _utcnow():
+    """Return current UTC time as a timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
 from confluent_kafka import Producer as ConfluentProducer
 
-# ── Config loaders ────────────────────────────────────────────────────────────
-def load_env_file(path=None):
-    if path is None:
-        path = os.path.join(os.path.dirname(__file__), "..", ".env")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_env(path=None):
+    path = path or os.path.join(os.path.dirname(__file__), "..", ".env")
     if not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -29,39 +64,42 @@ def load_env_file(path=None):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-def load_kafka_properties(path=None):
-    if path is None:
-        path = os.path.join(os.path.dirname(__file__), "..", "ccloud-python-client", "client.properties")
+
+def _load_kafka_props(path=None):
+    path = path or os.path.join(
+        os.path.dirname(__file__), "..", "ccloud-python-client", "client.properties"
+    )
     if not os.path.exists(path):
         return
     props = {}
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             props[k.strip()] = v.strip()
-    mapping = {
-        "bootstrap.servers": "KAFKA_BOOTSTRAP_SERVERS",
-        "sasl.username":     "KAFKA_SASL_USERNAME",
-        "sasl.password":     "KAFKA_SASL_PASSWORD",
-    }
-    for src, env in mapping.items():
+    for src, env in [
+        ("bootstrap.servers", "KAFKA_BOOTSTRAP_SERVERS"),
+        ("sasl.username",     "KAFKA_SASL_USERNAME"),
+        ("sasl.password",     "KAFKA_SASL_PASSWORD"),
+    ]:
         if src in props:
             os.environ.setdefault(env, props[src])
 
-load_env_file()
-load_kafka_properties()
 
-# ── Environment ───────────────────────────────────────────────────────────────
+_load_env()
+_load_kafka_props()
+
 BOOTSTRAP   = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
 SASL_USER   = os.getenv("KAFKA_SASL_USERNAME", "")
 SASL_PASS   = os.getenv("KAFKA_SASL_PASSWORD", "")
-TOPIC       = os.getenv("OEE_TOPIC",   "OEE_0")
+OEE_TOPIC   = os.getenv("OEE_TOPIC",   "OEE_0")
 ALERT_TOPIC = os.getenv("ALERT_TOPIC", "OEE_ALERTS")
-WARN_THR    = float(os.getenv("OEE_WARNING_THRESHOLD",  "55.0"))
-CRIT_THR    = float(os.getenv("OEE_CRITICAL_THRESHOLD", "40.0"))
+
+# Alert thresholds (% OEE)
+WARN_THRESHOLD = float(os.getenv("OEE_WARNING_THRESHOLD",  "55.0"))
+CRIT_THRESHOLD = float(os.getenv("OEE_CRITICAL_THRESHOLD", "40.0"))
 
 DB_CONF = dict(
     dbname   = os.getenv("PGDATABASE", "oee_db"),
@@ -79,49 +117,56 @@ KAFKA_CONF = {
     "sasl.password":     SASL_PASS,
 }
 
-# ── Alert producer (module-level, reused across batches) ──────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALERT KAFKA PRODUCER  (module-level, reused across batches)
+# ═══════════════════════════════════════════════════════════════════════════════
 try:
     alert_producer = ConfluentProducer(KAFKA_CONF)
-    print("[INFO] Alert producer initialized")
-except Exception as e:
-    print(f"[WARN] Alert producer init failed: {e}")
+    print("[INFO] Alert Kafka producer ready.")
+except Exception as exc:
+    print(f"[WARN] Alert producer init failed: {exc}")
     alert_producer = None
 
-# ── Spark session ─────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPARK SESSION
+# ═══════════════════════════════════════════════════════════════════════════════
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    from_json, col, window, avg, from_unixtime,
-    year, month, dayofmonth, hour
+    avg, col, from_json, from_unixtime, window,
 )
 from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType, LongType
+    DoubleType, StringType, StructField, StructType,
 )
 
-SCALA_VER  = os.getenv("SPARK_SCALA_BINARY_VERSION", "2.12")
-SPARK_VER  = "3.5.1"
+SCALA_VER = os.getenv("SPARK_SCALA_BINARY_VERSION", "2.12")
+SPARK_VER = "3.5.1"
 KAFKA_PKG  = f"org.apache.spark:spark-sql-kafka-0-10_{SCALA_VER}:{SPARK_VER}"
 
-# Extra packages (e.g. S3/MinIO support) can be added via env var
-extra = os.getenv("SPARK_EXTRA_PACKAGES", "").strip()
-packages = ",".join([KAFKA_PKG] + [p for p in extra.split(",") if p])
+extra_pkgs = os.getenv("SPARK_EXTRA_PACKAGES", "").strip()
+all_pkgs   = ",".join([KAFKA_PKG] + [p for p in extra_pkgs.split(",") if p])
 
 spark = (
     SparkSession.builder
     .appName("OEE_Streaming")
-    .config("spark.jars.packages", packages)
-    .config("spark.sql.shuffle.partitions", "4")   # keep small for local/single-node
-    .config("spark.ui.enabled", "false")            # disable Spark UI to save memory
+    .config("spark.jars.packages",          all_pkgs)
+    .config("spark.sql.shuffle.partitions", "4")    # small for single-node
+    .config("spark.ui.enabled",             "false") # save memory
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
 
-# ── Kafka source ──────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KAFKA SOURCE
+# ═══════════════════════════════════════════════════════════════════════════════
 kafka_options = {
-    "kafka.bootstrap.servers":  BOOTSTRAP,
-    "subscribe":                TOPIC,
-    "startingOffsets":          "latest",
-    "kafka.security.protocol":  "SASL_SSL",
-    "kafka.sasl.mechanism":     "PLAIN",
+    "kafka.bootstrap.servers": BOOTSTRAP,
+    "subscribe":               OEE_TOPIC,
+    "startingOffsets":         "latest",
+    "kafka.security.protocol": "SASL_SSL",
+    "kafka.sasl.mechanism":    "PLAIN",
     "kafka.sasl.jaas.config": (
         "org.apache.kafka.common.security.plain.PlainLoginModule required "
         f'username="{SASL_USER}" password="{SASL_PASS}";'
@@ -129,43 +174,57 @@ kafka_options = {
     "failOnDataLoss": "false",
 }
 
-raw_df = spark.readStream.format("kafka").options(**kafka_options).load()
+raw_kafka_df = spark.readStream.format("kafka").options(**kafka_options).load()
 
-# ── Schema & parsing ──────────────────────────────────────────────────────────
-msg_schema = StructType([
-    StructField("machine_id",   StringType()),
-    StructField("availability", DoubleType()),
-    StructField("performance",  DoubleType()),
-    StructField("quality",      DoubleType()),
-    StructField("oee",          DoubleType()),
-    StructField("timestamp",    DoubleType()),
-    StructField("message_id",   StringType()),
-    StructField("lot_id",       StringType()),
-    StructField("recipe_name",  StringType()),
-    StructField("chamber_id",   StringType()),
-    StructField("shift",        StringType()),
-    StructField("wph",          DoubleType()),
-    StructField("loss_event",   StructType([
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MESSAGE SCHEMA  (must match producer/Producer.py and schema/oee_message_schema.json)
+# ═══════════════════════════════════════════════════════════════════════════════
+MSG_SCHEMA = StructType([
+    StructField("machine_id",                  StringType()),
+    StructField("message_id",                  StringType()),
+    StructField("timestamp",                   DoubleType()),
+    StructField("shift",                       StringType()),
+    StructField("lot_id",                      StringType()),
+    # Raw production inputs
+    StructField("planned_production_time_min", DoubleType()),
+    StructField("downtime_min",                DoubleType()),
+    StructField("ideal_cycle_time_min",        DoubleType()),
+    StructField("total_pieces_run",            DoubleType()),
+    StructField("good_pieces",                 DoubleType()),
+    # Derived OEE components (computed by producer)
+    StructField("availability",                DoubleType()),
+    StructField("performance",                 DoubleType()),
+    StructField("quality",                     DoubleType()),
+    StructField("oee",                         DoubleType()),
+    # Active loss category
+    StructField("loss_category", StructType([
         StructField("name",      StringType()),
+        StructField("type",      StringType()),
         StructField("component", StringType()),
     ])),
 ])
 
-parsed = (
-    raw_df
-    .selectExpr("CAST(value AS STRING) as json_str")
-    .select(from_json(col("json_str"), msg_schema).alias("d"))
+# Parse JSON → typed columns, add event_time for windowing
+parsed_df = (
+    raw_kafka_df
+    .selectExpr("CAST(value AS STRING) AS json_str")
+    .select(from_json(col("json_str"), MSG_SCHEMA).alias("d"))
     .select("d.*")
     .withColumn("event_time", from_unixtime(col("timestamp")).cast("timestamp"))
 )
 
-# ── Windowed aggregation ──────────────────────────────────────────────────────
-windowed = (
-    parsed
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WINDOWED AGGREGATION
+# 1-minute window, 30-second slide, 2-minute watermark
+# ═══════════════════════════════════════════════════════════════════════════════
+windowed_df = (
+    parsed_df
     .withWatermark("event_time", "2 minutes")
     .groupBy(
         window(col("event_time"), "1 minute", "30 seconds"),
-        col("machine_id")
+        col("machine_id"),
     )
     .agg(
         avg("oee").alias("avg_oee"),
@@ -175,81 +234,305 @@ windowed = (
     )
 )
 
-# ── Loss categories upsert ────────────────────────────────────────────────────
-# Maps loss event component → Six Big Losses category
-_LOSS_TYPE_MAP = {
-    "availability": "Equipment Failure",
-    "performance":  "Reduced Speed",
-    "quality":      "Process Defects",
-}
 
-def _upsert_loss_categories(conn, raw_rows):
-    """Write loss events from raw Kafka rows into loss_categories table."""
-    cur = conn.cursor()
-    for row in raw_rows:
-        try:
-            if not row.loss_event or not row.loss_event.name:
-                continue
-            component  = row.loss_event.component or "availability"
-            loss_type  = _LOSS_TYPE_MAP.get(component, "Equipment Failure")
-            # Estimate loss_percentage as the deviation from 100 on the affected component
-            if component == "availability":
-                loss_pct = round(max(0, 100 - (row.availability or 0)), 2)
-            elif component == "performance":
-                loss_pct = round(max(0, 100 - (row.performance or 0)), 2)
-            else:
-                loss_pct = round(max(0, 100 - (row.quality or 0)), 2)
-            ts = datetime.utcfromtimestamp(row.timestamp) if row.timestamp else datetime.utcnow()
-            cur.execute("""
-                INSERT INTO loss_categories
-                  (machine_id, timestamp, loss_type, loss_component, loss_percentage, description)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (row.machine_id, ts, loss_type, component, loss_pct, row.loss_event.name))
-        except Exception as e:
-            print(f"[WARN] _upsert_loss_categories failed for row: {e}")
+# ═══════════════════════════════════════════════════════════════════════════════
+# DB HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _db_connect():
+    return psycopg2.connect(**DB_CONF)
 
 
-# ── Shift helper ─────────────────────────────────────────────────────────────
 def _shift_for_hour(h: int) -> str:
-    if 6 <= h <= 13:  return "morning"
-    if 14 <= h <= 21: return "afternoon"
+    if 6 <= h < 14:
+        return "morning"
+    if 14 <= h < 22:
+        return "afternoon"
     return "night"
 
 
-# ── Shift performance upsert ──────────────────────────────────────────────────
-def _upsert_shift_performance(conn, rows):
-    """Aggregate OEE rows by (machine_id, shift_date, shift) and upsert into shift_performance."""
+# ── Stream A helpers ──────────────────────────────────────────────────────────
+
+def _write_raw_events(conn, rows: list):
+    """
+    Insert individual OEE readings into oee_raw_events.
+    One row per Kafka message — used for time-series charts and ML.
+    """
+    cur = conn.cursor()
+    for r in rows:
+        if not r.machine_id or r.oee is None:
+            continue
+        if not (0 <= r.oee <= 100):
+            continue
+        event_time = (
+            datetime.fromtimestamp(r.timestamp, tz=timezone.utc)
+            if r.timestamp else _utcnow()
+        )
+        loss_name = r.loss_category.name      if r.loss_category else "none"
+        loss_type = r.loss_category.type      if r.loss_category else "none"
+        loss_comp = r.loss_category.component if r.loss_category else "none"
+
+        cur.execute("""
+            INSERT INTO oee_raw_events
+              (machine_id, event_time, oee, availability, performance, quality,
+               lot_id, shift, loss_event_name, loss_event_component, message_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (
+            r.machine_id, event_time,
+            round(r.oee,          4),
+            round(r.availability  or 0, 4),
+            round(r.performance   or 0, 4),
+            round(r.quality       or 0, 4),
+            getattr(r, "lot_id", None),
+            getattr(r, "shift",  None),
+            loss_name, loss_comp,
+            getattr(r, "message_id", None),
+        ))
+
+
+def _write_loss_categories(conn, rows: list):
+    """
+    Write active loss events to loss_categories (the 7 OEE Losses table).
+    Only writes rows where a real loss is active (type != 'none').
+    """
+    cur = conn.cursor()
+    for r in rows:
+        if not r.loss_category or r.loss_category.type == "none":
+            continue
+        comp = r.loss_category.component
+        # Loss percentage = how much the affected component deviated from 100 %
+        if comp == "availability":
+            loss_pct = round(max(0, 100 - (r.availability or 0)), 2)
+        elif comp == "performance":
+            loss_pct = round(max(0, 100 - (r.performance or 0)), 2)
+        else:
+            loss_pct = round(max(0, 100 - (r.quality or 0)), 2)
+
+        ts = (
+            datetime.fromtimestamp(r.timestamp, tz=timezone.utc)
+            if r.timestamp else _utcnow()
+        )
+        cur.execute("""
+            INSERT INTO loss_categories
+              (machine_id, timestamp, loss_type, loss_component, loss_percentage, description)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            r.machine_id, ts,
+            r.loss_category.type,
+            comp,
+            loss_pct,
+            r.loss_category.name,
+        ))
+
+
+# ── Stream B helpers ──────────────────────────────────────────────────────────
+
+def _upsert_oee_windows(conn, rows: list) -> int:
+    """
+    Upsert windowed OEE aggregates into oee_data.
+    Returns the number of rows written.
+    """
+    cur = conn.cursor()
+    written = 0
+    for r in rows:
+        if not isinstance(r.machine_id, str) or not r.machine_id:
+            continue
+        if r.avg_oee is None or not (0 <= r.avg_oee <= 100):
+            continue
+        cur.execute("""
+            INSERT INTO oee_data
+              (machine_id, window_start, window_end,
+               avg_oee, avg_availability, avg_performance, avg_quality)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (machine_id, window_start, window_end) DO UPDATE SET
+                avg_oee          = EXCLUDED.avg_oee,
+                avg_availability = EXCLUDED.avg_availability,
+                avg_performance  = EXCLUDED.avg_performance,
+                avg_quality      = EXCLUDED.avg_quality
+        """, (
+            r.machine_id,
+            r.window.start,
+            r.window.end,
+            round(r.avg_oee,          4),
+            round(r.avg_availability  or 0, 4),
+            round(r.avg_performance   or 0, 4),
+            round(r.avg_quality       or 0, 4),
+        ))
+        written += 1
+    return written
+
+
+def _fire_threshold_alerts(conn, rows: list):
+    """
+    Insert WARNING / CRITICAL alerts when avg_oee falls below thresholds.
+    Also publishes the alert to the Kafka ALERT_TOPIC.
+    """
+    cur = conn.cursor()
+    for r in rows:
+        if r.avg_oee is None or r.avg_oee >= WARN_THRESHOLD:
+            continue
+
+        level     = "CRITICAL" if r.avg_oee < CRIT_THRESHOLD else "WARNING"
+        threshold = CRIT_THRESHOLD if level == "CRITICAL" else WARN_THRESHOLD
+
+        cur.execute("""
+            INSERT INTO oee_alerts
+              (machine_id, avg_oee, threshold, window_start, window_end, alert_level)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            r.machine_id,
+            round(r.avg_oee, 4),
+            threshold,
+            r.window.start,
+            r.window.end,
+            level,
+        ))
+
+        if alert_producer:
+            payload = {
+                "machine_id":   r.machine_id,
+                "avg_oee":      round(r.avg_oee, 2),
+                "threshold":    threshold,
+                "alert_level":  level,
+                "window_start": r.window.start.isoformat(),
+                "window_end":   r.window.end.isoformat(),
+                "alert_id":     str(uuid.uuid4()),
+            }
+            try:
+                alert_producer.produce(ALERT_TOPIC, value=json.dumps(payload).encode())
+                alert_producer.poll(0)
+            except Exception as exc:
+                print(f"[WARN] Kafka alert produce failed: {exc}")
+
+
+def _compute_spc(conn, machine_id: str, batch_ts: datetime):
+    """
+    Compute SPC statistics (mean, std, UCL, LCL) for a machine
+    using the last 24 hours of windowed OEE data.
+
+    UCL = mean + 3 × std  (Upper Control Limit)
+    LCL = mean − 3 × std  (Lower Control Limit)
+
+    Requires at least 10 data points to be meaningful.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT avg_oee FROM oee_data
+        WHERE machine_id = %s
+          AND window_start >= NOW() - INTERVAL '24 hours'
+        ORDER BY window_start;
+    """, (machine_id,))
+    values = [r[0] for r in cur.fetchall() if r[0] is not None]
+
+    if len(values) < 10:
+        return  # not enough data yet
+
+    mean = statistics.mean(values)
+    std  = statistics.stdev(values)
+    ucl  = mean + 3 * std
+    lcl  = mean - 3 * std
+
+    cur.execute("""
+        INSERT INTO spc_data
+          (machine_id, calculated_at, metric, mean_value, std_dev, ucl, lcl, sample_size)
+        VALUES (%s, %s, 'oee', %s, %s, %s, %s, %s)
+    """, (
+        machine_id, batch_ts,
+        round(mean, 4), round(std, 4),
+        round(ucl,  4), round(lcl, 4),
+        len(values),
+    ))
+
+
+def _detect_spc_anomalies(conn, rows: list, batch_ts: datetime):
+    """
+    Flag windows where OEE is more than 2 standard deviations below the mean
+    (using SPC stats computed *before* this batch to avoid circular dependency).
+
+    Inserts an ANOMALY alert into oee_alerts and publishes to Kafka.
+    """
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    for r in rows:
+        if r.avg_oee is None:
+            continue
+        # Use the most recent SPC stats calculated before this batch
+        cur.execute("""
+            SELECT mean_value, std_dev FROM spc_data
+            WHERE machine_id = %s AND metric = 'oee'
+              AND calculated_at < %s
+            ORDER BY calculated_at DESC LIMIT 1;
+        """, (r.machine_id, batch_ts))
+        spc = cur.fetchone()
+        if not spc:
+            continue
+
+        anomaly_threshold = spc["mean_value"] - 2 * spc["std_dev"]
+        if r.avg_oee >= anomaly_threshold:
+            continue
+
+        # Insert anomaly alert
+        cur2 = conn.cursor()
+        cur2.execute("""
+            INSERT INTO oee_alerts
+              (machine_id, avg_oee, threshold, window_start, window_end, alert_level)
+            VALUES (%s, %s, %s, %s, %s, 'ANOMALY')
+        """, (
+            r.machine_id,
+            round(r.avg_oee, 4),
+            round(anomaly_threshold, 4),
+            r.window.start,
+            r.window.end,
+        ))
+
+        if alert_producer:
+            payload = {
+                "machine_id":   r.machine_id,
+                "avg_oee":      round(r.avg_oee, 2),
+                "threshold":    round(anomaly_threshold, 2),
+                "alert_level":  "ANOMALY",
+                "window_start": r.window.start.isoformat(),
+                "window_end":   r.window.end.isoformat(),
+                "alert_id":     str(uuid.uuid4()),
+            }
+            try:
+                alert_producer.produce(ALERT_TOPIC, value=json.dumps(payload).encode())
+                alert_producer.poll(0)
+            except Exception as exc:
+                print(f"[WARN] Kafka anomaly alert failed: {exc}")
+
+
+def _upsert_shift_performance(conn, rows: list):
+    """
+    Aggregate windowed OEE rows by (machine_id, shift_date, shift)
+    and upsert into shift_performance.
+    """
     from collections import defaultdict
-    groups = defaultdict(list)
-    for row in rows:
-        shift_date = row.window.start.date()
-        shift = _shift_for_hour(row.window.start.hour)
-        key = (row.machine_id, shift_date, shift)
-        groups[key].append(row.avg_oee)
+
+    # Group rows by (machine_id, shift_date, shift)
+    groups: dict[tuple, list] = defaultdict(list)
+    for r in rows:
+        if r.avg_oee is None:
+            continue
+        shift_date = r.window.start.date()
+        shift      = _shift_for_hour(r.window.start.hour)
+        groups[(r.machine_id, shift_date, shift)].append(r)
 
     cur = conn.cursor()
-    for (machine_id, shift_date, shift), oee_values in groups.items():
-        valid = [v for v in oee_values if v is not None]
-        if not valid:
-            continue
-        avg_oee = round(statistics.mean(valid), 4)
-        min_oee = round(min(valid), 4)
-        max_oee = round(max(valid), 4)
-        data_points = len(valid)
+    for (machine_id, shift_date, shift), group_rows in groups.items():
+        oee_vals  = [r.avg_oee         for r in group_rows if r.avg_oee         is not None]
+        avail_vals = [r.avg_availability for r in group_rows if r.avg_availability is not None]
+        perf_vals  = [r.avg_performance  for r in group_rows if r.avg_performance  is not None]
+        qual_vals  = [r.avg_quality      for r in group_rows if r.avg_quality      is not None]
 
-        # Gather APQ values for the same group
-        apq_rows = [r for r in rows
-                    if r.machine_id == machine_id
-                    and r.window.start.date() == shift_date
-                    and _shift_for_hour(r.window.start.hour) == shift]
-        avg_avail = round(statistics.mean([r.avg_availability for r in apq_rows if r.avg_availability is not None] or [0]), 4)
-        avg_perf  = round(statistics.mean([r.avg_performance  for r in apq_rows if r.avg_performance  is not None] or [0]), 4)
-        avg_qual  = round(statistics.mean([r.avg_quality      for r in apq_rows if r.avg_quality      is not None] or [0]), 4)
+        if not oee_vals:
+            continue
 
         cur.execute("""
             INSERT INTO shift_performance
-              (machine_id, shift_date, shift, avg_oee, avg_availability,
-               avg_performance, avg_quality, min_oee, max_oee, data_points)
+              (machine_id, shift_date, shift,
+               avg_oee, avg_availability, avg_performance, avg_quality,
+               min_oee, max_oee, data_points)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (machine_id, shift_date, shift) DO UPDATE SET
                 avg_oee          = EXCLUDED.avg_oee,
@@ -259,236 +542,102 @@ def _upsert_shift_performance(conn, rows):
                 min_oee          = EXCLUDED.min_oee,
                 max_oee          = EXCLUDED.max_oee,
                 data_points      = EXCLUDED.data_points
-        """, (machine_id, shift_date, shift, avg_oee, avg_avail,
-              avg_perf, avg_qual, min_oee, max_oee, data_points))
+        """, (
+            machine_id, shift_date, shift,
+            round(statistics.mean(oee_vals),   4),
+            round(statistics.mean(avail_vals) if avail_vals else 0, 4),
+            round(statistics.mean(perf_vals)  if perf_vals  else 0, 4),
+            round(statistics.mean(qual_vals)  if qual_vals  else 0, 4),
+            round(min(oee_vals), 4),
+            round(max(oee_vals), 4),
+            len(oee_vals),
+        ))
 
 
-# ── SPC computation ───────────────────────────────────────────────────────────
-def _compute_spc(conn, machine_id, batch_ts):
-    """Compute SPC statistics for a machine using last 24h of oee_data."""
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT avg_oee FROM oee_data
-            WHERE machine_id = %s
-              AND window_start >= NOW() - INTERVAL '24 hours'
-            ORDER BY window_start;
-        """, (machine_id,))
-        values = [r[0] for r in cur.fetchall() if r[0] is not None]
-        if len(values) < 10:
-            return
-        mean = statistics.mean(values)
-        std  = statistics.stdev(values)
-        ucl  = mean + 3 * std
-        lcl  = mean - 3 * std
-        cur.execute("""
-            INSERT INTO spc_data
-              (machine_id, calculated_at, metric, mean_value, std_dev, ucl, lcl, sample_size)
-            VALUES (%s, %s, 'oee', %s, %s, %s, %s, %s)
-        """, (machine_id, batch_ts, round(mean, 4), round(std, 4),
-              round(ucl, 4), round(lcl, 4), len(values)))
-    except Exception as e:
-        print(f"[WARN] _compute_spc failed for {machine_id}: {e}")
-
-
-# ── Anomaly detection ─────────────────────────────────────────────────────────
-def _detect_anomalies(conn, rows, ap, batch_ts):
-    """Detect OEE anomalies (> 2 std below mean) and insert alerts + publish to Kafka.
-    
-    Uses SPC statistics calculated strictly before batch_ts to avoid circular dependency
-    where _compute_spc contaminates the mean with the current batch's data.
-    """
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    for row in rows:
-        try:
-            cur.execute("""
-                SELECT mean_value, std_dev FROM spc_data
-                WHERE machine_id = %s AND metric = 'oee'
-                  AND calculated_at < %s
-                ORDER BY calculated_at DESC LIMIT 1;
-            """, (row.machine_id, batch_ts))
-            spc = cur.fetchone()
-            if not spc:
-                continue
-            threshold = spc["mean_value"] - 2 * spc["std_dev"]
-            if row.avg_oee < threshold:
-                msg = (f"ANOMALY: {row.machine_id} OEE={round(row.avg_oee,2)} "
-                       f"< mean({round(spc['mean_value'],2)}) - 2*std({round(spc['std_dev'],2)})")
-                cur2 = conn.cursor()
-                cur2.execute("""
-                    INSERT INTO oee_alerts
-                      (machine_id, avg_oee, threshold, window_start, window_end, alert_level)
-                    VALUES (%s, %s, %s, %s, %s, 'ANOMALY')
-                """, (row.machine_id, round(row.avg_oee, 4), round(threshold, 4),
-                      row.window.start, row.window.end))
-                if ap:
-                    payload = {
-                        "machine_id":   row.machine_id,
-                        "avg_oee":      round(row.avg_oee, 2),
-                        "threshold":    round(threshold, 2),
-                        "alert_level":  "ANOMALY",
-                        "window_start": row.window.start.isoformat(),
-                        "window_end":   row.window.end.isoformat(),
-                        "alert_id":     str(uuid.uuid4()),
-                    }
-                    try:
-                        ap.produce(ALERT_TOPIC, value=json.dumps(payload).encode())
-                        ap.poll(0)
-                    except Exception as e:
-                        print(f"[WARN] Anomaly alert produce failed: {e}")
-        except Exception as e:
-            print(f"[WARN] _detect_anomalies failed for {row.machine_id}: {e}")
-
-
-# ── Raw batch writer: loss categories + raw OEE events ───────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# STREAM A — foreachBatch: raw events + loss categories
+# ═══════════════════════════════════════════════════════════════════════════════
 def write_raw_batch(batch_df, batch_id):
-    """Write raw OEE events and loss events from raw parsed messages."""
+    """Called every 10 s with raw parsed messages."""
     rows = batch_df.collect()
     if not rows:
         return
-    conn = psycopg2.connect(**DB_CONF)
+    conn = _db_connect()
     try:
-        _upsert_loss_categories(conn, rows)
-        _insert_raw_oee_events(conn, rows)
+        _write_raw_events(conn, rows)
+        _write_loss_categories(conn, rows)
         conn.commit()
-    except Exception as e:
-        print(f"[WARN] write_raw_batch error: {e}")
+    except Exception as exc:
+        conn.rollback()
+        print(f"[ERROR] write_raw_batch (batch {batch_id}): {exc}")
     finally:
         conn.close()
 
 
-def _insert_raw_oee_events(conn, raw_rows):
-    """Insert individual raw OEE readings into oee_raw_events for ML/ARIMA use."""
-    cur = conn.cursor()
-    for row in raw_rows:
-        try:
-            if not row.machine_id or row.oee is None:
-                continue
-            if not (0 <= row.oee <= 100):
-                continue
-            event_time = datetime.utcfromtimestamp(row.timestamp) if row.timestamp else datetime.utcnow()
-            loss_name = row.loss_event.name      if row.loss_event else None
-            loss_comp = row.loss_event.component if row.loss_event else None
-            cur.execute("""
-                INSERT INTO oee_raw_events
-                  (machine_id, event_time, oee, availability, performance, quality,
-                   lot_id, recipe_name, chamber_id, shift, wph,
-                   loss_event_name, loss_event_component, message_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (
-                row.machine_id, event_time,
-                round(row.oee, 4),
-                round(row.availability or 0, 4),
-                round(row.performance  or 0, 4),
-                round(row.quality      or 0, 4),
-                getattr(row, "lot_id",      None),
-                getattr(row, "recipe_name", None),
-                getattr(row, "chamber_id",  None),
-                getattr(row, "shift",       None),
-                getattr(row, "wph",         None),
-                loss_name, loss_comp,
-                getattr(row, "message_id",  None),
-            ))
-        except Exception as e:
-            print(f"[WARN] _insert_raw_oee_events failed for row: {e}")
-
-
-# ── Batch writer: Postgres + Alerts ──────────────────────────────────────────
-def write_batch(batch_df, batch_id):
+# ═══════════════════════════════════════════════════════════════════════════════
+# STREAM B — foreachBatch: windowed OEE + alerts + SPC + shifts
+# ═══════════════════════════════════════════════════════════════════════════════
+def write_windowed_batch(batch_df, batch_id):
+    """Called every 10 s with windowed aggregates."""
     rows = batch_df.collect()
     if not rows:
         return
 
-    conn = psycopg2.connect(**DB_CONF)
-    cur  = conn.cursor()
-    written = 0
+    conn      = _db_connect()
+    batch_ts  = _utcnow()
 
-    for row in rows:
-        # Basic validation
-        if not isinstance(row.machine_id, str) or not row.machine_id:
-            continue
-        if not (0 <= row.avg_oee <= 100):
-            continue
-
-        w_start = row.window.start
-        w_end   = row.window.end
-
-        # Upsert OEE window
-        cur.execute("""
-            INSERT INTO oee_data (machine_id, window_start, window_end, avg_oee,
-                                  avg_availability, avg_performance, avg_quality)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (machine_id, window_start, window_end)
-            DO UPDATE SET
-                avg_oee          = EXCLUDED.avg_oee,
-                avg_availability = EXCLUDED.avg_availability,
-                avg_performance  = EXCLUDED.avg_performance,
-                avg_quality      = EXCLUDED.avg_quality
-        """, (
-            row.machine_id, w_start, w_end,
-            round(row.avg_oee, 4),
-            round(row.avg_availability or 0, 4),
-            round(row.avg_performance  or 0, 4),
-            round(row.avg_quality      or 0, 4),
-        ))
-        written += 1
-
-        # Alerting
-        if row.avg_oee < WARN_THR:
-            level     = "CRITICAL" if row.avg_oee < CRIT_THR else "WARNING"
-            threshold = CRIT_THR   if level == "CRITICAL"    else WARN_THR
-
-            cur.execute("""
-                INSERT INTO oee_alerts
-                  (machine_id, avg_oee, threshold, window_start, window_end, alert_level)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (row.machine_id, round(row.avg_oee, 4), threshold, w_start, w_end, level))
-
-            if alert_producer:
-                payload = {
-                    "machine_id":   row.machine_id,
-                    "avg_oee":      round(row.avg_oee, 2),
-                    "threshold":    threshold,
-                    "alert_level":  level,
-                    "window_start": w_start.isoformat(),
-                    "window_end":   w_end.isoformat(),
-                    "alert_id":     str(uuid.uuid4()),
-                }
-                try:
-                    alert_producer.produce(ALERT_TOPIC, value=json.dumps(payload).encode())
-                    alert_producer.poll(0)
-                except Exception as e:
-                    print(f"[WARN] Alert produce failed: {e}")
-
-    conn.commit()
-
-    # ── Analytics helpers ─────────────────────────────────────────────────────
-    batch_ts = datetime.utcnow()
-    machine_ids = {row.machine_id for row in rows if isinstance(row.machine_id, str) and row.machine_id}
-    for machine_id in machine_ids:
-        _compute_spc(conn, machine_id, batch_ts)
-    _upsert_shift_performance(conn, rows)
-    _detect_anomalies(conn, rows, alert_producer, batch_ts)
-    conn.commit()
-
-    cur.close()
-    conn.close()
-
-    if written:
-        print(f"[Spark] Batch {batch_id}: wrote {written} window(s) at "
-              f"{datetime.now().strftime('%H:%M:%S')}")
-
-# ── Ensure schema supports new columns ───────────────────────────────────────
-def ensure_schema():
     try:
-        conn = psycopg2.connect(**DB_CONF)
+        # 1. Write windowed OEE averages
+        written = _upsert_oee_windows(conn, rows)
+
+        # 2. Fire threshold-based alerts (WARNING / CRITICAL)
+        _fire_threshold_alerts(conn, rows)
+
+        conn.commit()  # commit OEE data + threshold alerts before SPC
+
+        # 3. Compute SPC for each machine (uses data already committed above)
+        machine_ids = {r.machine_id for r in rows if r.machine_id}
+        for mid in machine_ids:
+            _compute_spc(conn, mid, batch_ts)
+
+        # 4. Detect statistical anomalies using SPC stats from *before* this batch
+        _detect_spc_anomalies(conn, rows, batch_ts)
+
+        # 5. Aggregate shift performance
+        _upsert_shift_performance(conn, rows)
+
+        conn.commit()
+
+        if written:
+            print(
+                f"[Spark] Batch {batch_id}: {written} window(s) written "
+                f"at {datetime.now().strftime('%H:%M:%S')}"
+            )
+
+    except Exception as exc:
+        conn.rollback()
+        print(f"[ERROR] write_windowed_batch (batch {batch_id}): {exc}")
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCHEMA MIGRATION  (idempotent — safe to run on every start)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _ensure_schema():
+    """Add any missing columns and constraints to existing tables."""
+    try:
+        conn = _db_connect()
         cur  = conn.cursor()
+
+        # Ensure APQ columns exist on oee_data
         for col_name in ("avg_availability", "avg_performance", "avg_quality"):
             cur.execute(f"""
                 ALTER TABLE oee_data
                 ADD COLUMN IF NOT EXISTS {col_name} DOUBLE PRECISION;
             """)
+
+        # Ensure unique constraint for upsert
         cur.execute("""
             DO $$ BEGIN
               IF NOT EXISTS (
@@ -501,36 +650,47 @@ def ensure_schema():
               END IF;
             END$$;
         """)
+
         conn.commit()
         cur.close()
         conn.close()
-    except Exception as e:
-        print(f"[WARN] Schema migration: {e}")
+        print("[INFO] Schema migration complete.")
+    except Exception as exc:
+        print(f"[WARN] Schema migration: {exc}")
 
-ensure_schema()
 
-# ── Start streaming query ─────────────────────────────────────────────────────
-print(f"🚀 OEE Spark Streaming started")
-print(f"   Topic: {TOPIC} → Postgres oee_data")
-print(f"   Windows: 1 min / 30s slide | Trigger: 10s")
+_ensure_schema()
 
-query = (
-    windowed.writeStream
-    .outputMode("update")
-    .foreachBatch(write_batch)
-    .trigger(processingTime="10 seconds")
-    .option("checkpointLocation", "/tmp/oee_spark_checkpoint")
-    .start()
-)
 
-# Second stream: raw messages → loss_categories
-raw_query = (
-    parsed.writeStream
+# ═══════════════════════════════════════════════════════════════════════════════
+# START STREAMING QUERIES
+# ═══════════════════════════════════════════════════════════════════════════════
+print("🚀 OEE Spark Streaming started")
+print(f"   Source topic : {OEE_TOPIC}")
+print(f"   Alert topic  : {ALERT_TOPIC}")
+print(f"   Window       : 1 min / 30 s slide | Trigger: 10 s")
+print(f"   Thresholds   : WARNING < {WARN_THRESHOLD}%  CRITICAL < {CRIT_THRESHOLD}%\n")
+
+# Stream A — raw events
+# Trigger every 3 s so the real-time OEE chart has minimal lag.
+# Kafka buffers messages safely between triggers — nothing is lost.
+stream_raw = (
+    parsed_df.writeStream
     .outputMode("append")
     .foreachBatch(write_raw_batch)
-    .trigger(processingTime="10 seconds")
-    .option("checkpointLocation", "/tmp/oee_spark_raw_checkpoint")
+    .trigger(processingTime="3 seconds")
+    .option("checkpointLocation", "/tmp/oee_checkpoint_raw")
     .start()
 )
 
-query.awaitTermination()
+# Stream B — windowed aggregates
+stream_windowed = (
+    windowed_df.writeStream
+    .outputMode("update")
+    .foreachBatch(write_windowed_batch)
+    .trigger(processingTime="10 seconds")
+    .option("checkpointLocation", "/tmp/oee_checkpoint_windowed")
+    .start()
+)
+
+stream_windowed.awaitTermination()
