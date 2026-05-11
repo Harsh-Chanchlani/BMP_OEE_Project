@@ -357,24 +357,113 @@ def get_shifts(
         r["shift_date"] = r["shift_date"].isoformat()
     return rows
 
+@app.get("/api/oee/forecast")
+def get_forecast(machine: str = Query(...), token: dict = Depends(require_auth)):
+    """
+    Return the latest ARIMA forecast batch for a machine.
+    Always returns the most recent prediction_time batch (10 steps).
+    """
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT target_time, predicted_oee, confidence_lower, confidence_upper,
+               model_type, prediction_time
+        FROM oee_predictions
+        WHERE machine_id = %s
+          AND prediction_time = (
+              SELECT MAX(prediction_time)
+              FROM oee_predictions
+              WHERE machine_id = %s
+          )
+        ORDER BY target_time ASC;
+    """, (machine, machine))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    for r in rows:
+        r["target_time"]     = r["target_time"].isoformat()
+        r["prediction_time"] = r["prediction_time"].isoformat()
+    return rows
+
+
+@app.get("/api/oee/forecast_vs_actual")
+def get_forecast_vs_actual(machine: str = Query(...), token: dict = Depends(require_auth)):
+    """
+    For each historical prediction batch, find the actual OEE window that
+    covers that target_time and return both values side by side.
+
+    This powers the "predicted vs actual" comparison chart — you can see
+    exactly where the forecast was right or wrong.
+
+    Returns rows ordered by target_time with:
+      - target_time: when the prediction was for
+      - predicted_oee: what ARIMA said OEE would be
+      - actual_oee: what oee_data actually recorded (null if no window yet)
+      - confidence_lower / confidence_upper: 95% CI
+      - prediction_time: when the forecast was made
+    """
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # Join predictions against oee_data windows that contain the target_time.
+    # Use the last 24h of predictions to keep the chart readable.
+    cur.execute("""
+        SELECT
+            p.target_time,
+            p.predicted_oee,
+            p.confidence_lower,
+            p.confidence_upper,
+            p.prediction_time,
+            d.avg_oee AS actual_oee,
+            d.window_start,
+            d.window_end
+        FROM oee_predictions p
+        LEFT JOIN oee_data d
+            ON d.machine_id = p.machine_id
+            AND p.target_time >= d.window_start
+            AND p.target_time <  d.window_end
+        WHERE p.machine_id = %s
+          AND p.prediction_time >= NOW() - INTERVAL '24 hours'
+        ORDER BY p.target_time ASC;
+    """, (machine,))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    for r in rows:
+        r["target_time"]     = r["target_time"].isoformat()
+        r["prediction_time"] = r["prediction_time"].isoformat()
+        if r["window_start"]: r["window_start"] = r["window_start"].isoformat()
+        if r["window_end"]:   r["window_end"]   = r["window_end"].isoformat()
+    return rows
+
 @app.get("/api/losses")
 def get_losses(machine: Optional[str] = Query(None), token: dict = Depends(require_auth)):
+    """
+    Return aggregated loss data from the loss_categories table.
+    Groups by loss_type and loss_component, averaging loss_percentage from the last 24 hours.
+    
+    This powers the LossesChart Pareto visualization showing the 7 OEE losses.
+    
+    Returns rows with:
+      - loss_type: type of loss (e.g., 'unplanned_downtime', 'planned_downtime')
+      - loss_component: OEE component affected (e.g., 'Availability', 'Performance', 'Quality')
+      - total_loss_percentage: average loss percentage for this type/component combination
+    """
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     if machine:
         cur.execute("""
             SELECT loss_type, loss_component,
-                   SUM(loss_percentage) AS total_loss_percentage
+                   AVG(loss_percentage) AS total_loss_percentage
             FROM loss_categories
             WHERE machine_id = %s
+              AND timestamp >= NOW() - INTERVAL '24 hours'
             GROUP BY loss_type, loss_component
             ORDER BY total_loss_percentage DESC;
         """, (machine,))
     else:
         cur.execute("""
             SELECT loss_type, loss_component,
-                   SUM(loss_percentage) AS total_loss_percentage
+                   AVG(loss_percentage) AS total_loss_percentage
             FROM loss_categories
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'
             GROUP BY loss_type, loss_component
             ORDER BY total_loss_percentage DESC;
         """)
