@@ -20,14 +20,18 @@ function getThreshold(value) {
 }
 
 // ── 7 OEE Loss colours (Kennedy's book) ──────────────────────────────────────
+// Colour coding follows Kennedy's model:
+//   Availability losses: Unplanned = RED (target: Zero), Setup = ORANGE (Minimize), Planned = BLUE (Minimize — neutral, not a failure)
+//   Performance losses:  Minor Stoppage = AMBER, Reduced Speed = YELLOW (Minimize)
+//   Quality losses:      Rejects = BLUE-VIOLET, Startup Yield = INDIGO (Minimize/Zero)
 const LOSS_COLORS = {
-  unplanned_downtime:  "#ff4757",
-  setup_changeover:    "#ff6b6b",
-  planned_downtime:    "#ff8c42",
-  minor_stoppage:      "#f59e0b",
-  reduced_speed:       "#fbbf24",
-  rejects_rework:      "#60a5fa",
-  startup_yield_loss:  "#818cf8",
+  unplanned_downtime:  "#ff4757",  // RED   — target Zero (Kennedy Fig 1.2)
+  setup_changeover:    "#ff8c42",  // ORANGE — Minimize
+  planned_downtime:    "#60a5fa",  // BLUE   — Minimize but NEUTRAL (not a failure, management decision)
+  minor_stoppage:      "#f59e0b",  // AMBER  — target Zero
+  reduced_speed:       "#fbbf24",  // YELLOW — Minimize
+  rejects_rework:      "#a78bfa",  // VIOLET — target Zero
+  startup_yield_loss:  "#818cf8",  // INDIGO — Minimize
   none:                "#6b7280",
 };
 
@@ -942,6 +946,11 @@ function ApqChart({ machine }) {
 }
 
 // ── 4. 7 OEE Losses Pareto Chart ─────────────────────────────────────────────
+// Kennedy's Time-Loss Pareto (Chapter 3, Figure 3.5):
+//   Primary Y-axis  = Time Lost (minutes) — the actionable metric
+//   Secondary Y-axis = Cumulative % — for 80/20 Pareto analysis
+//   Bars sorted descending by time lost, red cumulative line
+//   Planned Downtime shown in BLUE (neutral) — it's a management decision, not a failure
 function LossesChart({ machine }) {
   const [lossData, setLossData]     = useState([]);
   const [hoveredLoss, setHoveredLoss] = useState(null);
@@ -954,16 +963,19 @@ function LossesChart({ machine }) {
         if (!Array.isArray(data)) return;
         const sorted = [...data]
           .filter((d) => d.loss_type !== "none")
-          .sort((a, b) => b.total_loss_percentage - a.total_loss_percentage);
+          .sort((a, b) => b.loss_minutes - a.loss_minutes);  // sort by TIME LOST (Kennedy's model)
         let cumulative = 0;
-        const total = sorted.reduce((s, d) => s + Number(d.total_loss_percentage), 0);
+        const totalMinutes = sorted.reduce((s, d) => s + Number(d.loss_minutes || 0), 0);
         const withCumulative = sorted.map((d) => {
-          cumulative += Number(d.total_loss_percentage);
+          cumulative += Number(d.loss_minutes || 0);
           return {
             ...d,
             label: LOSS_LABELS[d.loss_type] || d.loss_type,
             category: LOSS_CATEGORY[d.loss_type] || "—",
-            cumulative_pct: total > 0 ? parseFloat((cumulative / total * 100).toFixed(1)) : 0,
+            // Kennedy Time-Loss model: show actual minutes lost
+            minutes_lost: parseFloat(Number(d.loss_minutes || 0).toFixed(1)),
+            // Cumulative % for Pareto line (80/20 rule)
+            cumulative_pct: totalMinutes > 0 ? parseFloat((cumulative / totalMinutes * 100).toFixed(1)) : 0,
           };
         });
         setLossData(withCumulative);
@@ -976,21 +988,21 @@ function LossesChart({ machine }) {
       borderRadius: 16, padding: "20px 24px" }}>
       <div style={{ marginBottom: 12 }}>
         <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "2px", color: "rgba(255,255,255,0.8)" }}>
-          7 OEE LOSSES — PARETO
+          7 OEE LOSSES — TIME-LOSS PARETO
         </div>
         <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", marginTop: 3 }}>
-          Kennedy's 7 OEE losses · bars = loss magnitude · red line = cumulative % · fix tallest bars first (80/20 rule)
+          Kennedy's Time-Loss model · bars = minutes lost · red line = cumulative % · fix tallest bars first (80/20 rule) · blue = planned (management decision)
         </div>
       </div>
 
-      {/* Category legend */}
+      {/* Category legend — matches Kennedy Fig 1.2 colour coding */}
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
         {[
-          { label: "Availability Losses", color: "#ff4757" },
-          { label: "Performance Losses",  color: "#f59e0b" },
-          { label: "Quality Losses",      color: "#60a5fa" },
-        ].map(({ label, color }) => (
-          <div key={label} style={{ background: `${color}15`, border: `1px solid ${color}40`,
+          { label: "Availability Losses", color: "#ff4757", note: "Unplanned=Red, Setup=Orange, Planned=Blue" },
+          { label: "Performance Losses",  color: "#f59e0b", note: "Minor Stoppage=Amber, Reduced Speed=Yellow" },
+          { label: "Quality Losses",      color: "#a78bfa", note: "Rejects=Violet, Startup=Indigo" },
+        ].map(({ label, color, note }) => (
+          <div key={label} title={note} style={{ background: `${color}15`, border: `1px solid ${color}40`,
             borderRadius: 6, padding: "3px 10px" }}>
             <span style={{ fontSize: 10, color, fontWeight: 700 }}>{label}</span>
           </div>
@@ -1021,20 +1033,22 @@ function LossesChart({ machine }) {
         <div style={{ height: 220, display: "flex", alignItems: "center", justifyContent: "center",
           color: "rgba(255,255,255,0.2)", fontSize: 12 }}>No loss data available</div>
       ) : (
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={260}>
           <ComposedChart data={lossData} margin={{ top: 10, right: 60, bottom: 60, left: 20 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
             <XAxis dataKey="label"
               tick={{ fill: "rgba(255,255,255,0.45)", fontSize: 10 }}
               tickLine={false} axisLine={false}
               angle={-30} textAnchor="end" interval={0}
-              label={{ value: "Loss Type", position: "insideBottom", offset: -48,
+              label={{ value: "Loss Type (Kennedy's 7 Losses)", position: "insideBottom", offset: -48,
                 fill: "rgba(255,255,255,0.3)", fontSize: 11 }} />
+            {/* Primary Y: Time Lost in Minutes (Kennedy's Time-Loss model) */}
             <YAxis yAxisId="left"
               tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }} tickLine={false} axisLine={false}
-              tickFormatter={(v) => `${v}%`} width={48}
-              label={{ value: "Loss (%)", angle: -90, position: "insideLeft", offset: 14,
+              tickFormatter={(v) => `${v}m`} width={52}
+              label={{ value: "Time Lost (min)", angle: -90, position: "insideLeft", offset: 14,
                 fill: "rgba(255,255,255,0.3)", fontSize: 11 }} />
+            {/* Secondary Y: Cumulative % for Pareto line */}
             <YAxis yAxisId="right" orientation="right" domain={[0, 100]}
               tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }} tickLine={false} axisLine={false}
               tickFormatter={(v) => `${v}%`}
@@ -1045,32 +1059,39 @@ function LossesChart({ machine }) {
                 if (!active || !payload?.length) return null;
                 const d = payload[0]?.payload;
                 const color = LOSS_COLORS[d?.loss_type] || "#f59e0b";
+                const isPlanned = d?.loss_type === "planned_downtime";
                 return (
                   <div style={{ background: "#0d1117", border: "1px solid rgba(255,255,255,0.15)",
-                    borderRadius: 8, padding: "10px 14px", fontFamily: "monospace", maxWidth: 240 }}>
+                    borderRadius: 8, padding: "10px 14px", fontFamily: "monospace", maxWidth: 260 }}>
                     <div style={{ color, fontWeight: 700, fontSize: 11, marginBottom: 4 }}>
                       {d?.label}
+                      {isPlanned && <span style={{ color: "#60a5fa", fontSize: 9, marginLeft: 6 }}>(management decision)</span>}
                     </div>
                     <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 11 }}>
                       Category: <strong style={{ color }}>{d?.category}</strong>
                     </div>
-                    <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 11 }}>
-                      Loss: <strong>{Number(d?.total_loss_percentage).toFixed(2)}%</strong>
+                    <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, marginTop: 2 }}>
+                      Time Lost: <strong>{Number(d?.minutes_lost).toFixed(1)} min</strong>
                     </div>
                     <div style={{ color: "rgba(255,255,255,0.5)", fontSize: 11 }}>
+                      Avg Loss %: <strong>{Number(d?.total_loss_percentage).toFixed(1)}%</strong>
+                    </div>
+                    <div style={{ color: "#ff4757", fontSize: 11 }}>
                       Cumulative: <strong>{d?.cumulative_pct}%</strong>
                     </div>
                   </div>
                 );
               }}
             />
-            <Bar yAxisId="left" dataKey="total_loss_percentage" name="Loss %"
+            {/* Bars coloured by loss type — planned downtime is BLUE (neutral) */}
+            <Bar yAxisId="left" dataKey="minutes_lost" name="Time Lost (min)"
               label={{ position: "top", fill: "rgba(255,255,255,0.5)", fontSize: 10,
-                formatter: (v) => `${Number(v).toFixed(1)}%` }}>
+                formatter: (v) => `${Number(v).toFixed(0)}m` }}>
               {lossData.map((entry, index) => (
                 <Cell key={`cell-${index}`} fill={LOSS_COLORS[entry.loss_type] || "#f59e0b"} />
               ))}
             </Bar>
+            {/* Cumulative % line — red as per Kennedy's Pareto charts */}
             <Line yAxisId="right" type="monotone" dataKey="cumulative_pct" name="Cumulative %"
               stroke="#ff4757" strokeWidth={2.5} dot={{ r: 4, fill: "#ff4757" }}
               activeDot={{ r: 6, fill: "#ff4757" }} />

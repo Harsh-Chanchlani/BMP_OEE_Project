@@ -437,38 +437,49 @@ def get_forecast_vs_actual(machine: str = Query(...), token: dict = Depends(requ
 def get_losses(machine: Optional[str] = Query(None), token: dict = Depends(require_auth)):
     """
     Return aggregated loss data from the loss_categories table.
-    Groups by loss_type and loss_component, averaging loss_percentage from the last 24 hours.
-    
-    This powers the LossesChart Pareto visualization showing the 7 OEE losses.
-    
+    Implements Kennedy's Time-Loss model (Chapter 3, Figure 3.4):
+      - loss_minutes: total minutes lost per loss type (primary metric for Pareto)
+      - total_loss_percentage: average loss % per loss type (secondary context)
+
+    Kennedy emphasises that actionable improvement is driven by analysing
+    actual TIME LOST, not just percentages. The Pareto chart should be sorted
+    by minutes lost so teams focus on the biggest time consumers first.
+
     Returns rows with:
-      - loss_type: type of loss (e.g., 'unplanned_downtime', 'planned_downtime')
-      - loss_component: OEE component affected (e.g., 'Availability', 'Performance', 'Quality')
-      - total_loss_percentage: average loss percentage for this type/component combination
+      - loss_type: one of the 7 Kennedy losses
+      - loss_component: OEE component affected (availability/performance/quality)
+      - loss_minutes: total minutes lost to this loss type in the last 24 hours
+      - total_loss_percentage: average loss percentage for context
     """
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     if machine:
         cur.execute("""
             SELECT loss_type, loss_component,
-                   AVG(loss_percentage) AS total_loss_percentage
+                   SUM(loss_minutes)      AS loss_minutes,
+                   AVG(loss_percentage)   AS total_loss_percentage
             FROM loss_categories
             WHERE machine_id = %s
               AND timestamp >= NOW() - INTERVAL '24 hours'
             GROUP BY loss_type, loss_component
-            ORDER BY total_loss_percentage DESC;
+            ORDER BY loss_minutes DESC;
         """, (machine,))
     else:
         cur.execute("""
             SELECT loss_type, loss_component,
-                   AVG(loss_percentage) AS total_loss_percentage
+                   SUM(loss_minutes)      AS loss_minutes,
+                   AVG(loss_percentage)   AS total_loss_percentage
             FROM loss_categories
             WHERE timestamp >= NOW() - INTERVAL '24 hours'
             GROUP BY loss_type, loss_component
-            ORDER BY total_loss_percentage DESC;
+            ORDER BY loss_minutes DESC;
         """)
     rows = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
+    # Ensure numeric types are JSON-serialisable
+    for r in rows:
+        r["loss_minutes"]           = float(r["loss_minutes"] or 0)
+        r["total_loss_percentage"]  = float(r["total_loss_percentage"] or 0)
     return rows
 
 # --- WebSocket Endpoints ---

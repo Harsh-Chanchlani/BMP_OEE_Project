@@ -293,21 +293,38 @@ def _write_raw_events(conn, rows: list):
 
 def _write_loss_categories(conn, rows: list):
     """
-    Write active loss events to loss_categories (the 7 OEE Losses table).
+    Write active loss events to loss_categories (Kennedy's 7 OEE Losses table).
     Only writes rows where a real loss is active (type != 'none').
+
+    Kennedy's Time-Loss model (Chapter 3):
+      loss_minutes = actual time lost to this loss in this window
+      loss_percentage = how much the affected component deviated from 100%
+
+    For each raw event (0.5s window):
+      - availability loss: downtime_min is the actual time lost
+      - performance loss: time lost = planned_window × (1 - speed_ratio)
+      - quality loss: time lost = (defect_pieces / ideal_speed) in minutes
     """
     cur = conn.cursor()
     for r in rows:
         if not r.loss_category or r.loss_category.type == "none":
             continue
-        comp = r.loss_category.component
-        # Loss percentage = how much the affected component deviated from 100 %
+        comp    = r.loss_category.component
+        planned = getattr(r, "planned_production_time_min", 0.5) or 0.5
+
+        # ── Loss percentage: deviation of the affected component from 100% ──
         if comp == "availability":
             loss_pct = round(max(0, 100 - (r.availability or 0)), 2)
+            # Time lost = downtime_min (the actual recorded downtime for this window)
+            loss_min = round(max(0, getattr(r, "downtime_min", 0) or 0), 4)
         elif comp == "performance":
             loss_pct = round(max(0, 100 - (r.performance or 0)), 2)
-        else:
+            # Time lost = planned window × performance loss fraction
+            loss_min = round(planned * (loss_pct / 100.0), 4)
+        else:  # quality
             loss_pct = round(max(0, 100 - (r.quality or 0)), 2)
+            # Time lost = quality loss fraction × planned window
+            loss_min = round(planned * (loss_pct / 100.0), 4)
 
         ts = (
             datetime.fromtimestamp(r.timestamp, tz=timezone.utc)
@@ -315,13 +332,15 @@ def _write_loss_categories(conn, rows: list):
         )
         cur.execute("""
             INSERT INTO loss_categories
-              (machine_id, timestamp, loss_type, loss_component, loss_percentage, description)
-            VALUES (%s, %s, %s, %s, %s, %s)
+              (machine_id, timestamp, loss_type, loss_component,
+               loss_percentage, loss_minutes, description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             r.machine_id, ts,
             r.loss_category.type,
             comp,
             loss_pct,
+            loss_min,
             r.loss_category.name,
         ))
 
