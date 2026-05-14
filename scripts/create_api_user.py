@@ -28,13 +28,17 @@ def main():
     args = parser.parse_args()
 
     # DB Connection
-    conn = psycopg2.connect(
-        dbname=os.getenv("PGDATABASE", "oee_db"),
-        user=os.getenv("PGUSER", "harshchanchlani"),
-        password=os.getenv("PGPASSWORD", ""),
-        host=os.getenv("PGHOST", "localhost"),
-        port=os.getenv("PGPORT", "5432")
-    )
+    db_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+    if db_url:
+        conn = psycopg2.connect(db_url)
+    else:
+        conn = psycopg2.connect(
+            dbname=os.getenv("PGDATABASE", "oee_db"),
+            user=os.getenv("PGUSER", "harshchanchlani"),
+            password=os.getenv("PGPASSWORD", ""),
+            host=os.getenv("PGHOST", "localhost"),
+            port=os.getenv("PGPORT", "5432")
+        )
     cur = conn.cursor()
 
     hashed = hash_password(args.password)

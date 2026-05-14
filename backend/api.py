@@ -4,6 +4,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import os
 import asyncio
 import json
@@ -40,15 +41,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DB Utility ---
-def get_conn():
-    return psycopg2.connect(
+# ── Connection Pool ────────────────────────────────────────────────────────────
+# Opens 2–8 persistent connections to Neon at startup.
+# Each get_conn() call borrows one in <1ms instead of opening a new TCP
+# connection (~870ms). putconn() returns it to the pool for reuse.
+_DB_URL = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+
+def _make_pool():
+    kwargs = dict(minconn=2, maxconn=8)
+    if _DB_URL:
+        return psycopg2.pool.ThreadedConnectionPool(2, 8, _DB_URL)
+    return psycopg2.pool.ThreadedConnectionPool(
+        2, 8,
         dbname=os.getenv("PGDATABASE", "oee_db"),
         user=os.getenv("PGUSER", "harshchanchlani"),
         password=os.getenv("PGPASSWORD", ""),
         host=os.getenv("PGHOST", "localhost"),
         port=os.getenv("PGPORT", "5432"),
     )
+
+_pool: psycopg2.pool.ThreadedConnectionPool = _make_pool()
+
+def get_conn():
+    """Borrow a connection from the pool. Always call putconn() when done."""
+    try:
+        conn = _pool.getconn()
+        # Ensure connection is alive (Neon drops idle connections after 5 min)
+        if conn.closed:
+            _pool.putconn(conn)
+            conn = _pool.getconn()
+        return conn
+    except Exception:
+        # Pool exhausted or all connections dead — fall back to fresh connection
+        if _DB_URL:
+            return psycopg2.connect(_DB_URL)
+        return psycopg2.connect(
+            dbname=os.getenv("PGDATABASE", "oee_db"),
+            user=os.getenv("PGUSER", "harshchanchlani"),
+            password=os.getenv("PGPASSWORD", ""),
+            host=os.getenv("PGHOST", "localhost"),
+            port=os.getenv("PGPORT", "5432"),
+        )
+
+def putconn(conn):
+    """Return a connection to the pool. Resets it if it had an error."""
+    try:
+        if conn and not conn.closed:
+            # Reset any aborted transaction before returning to pool
+            if conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
+                conn.rollback()
+            _pool.putconn(conn)
+        elif conn:
+            _pool.putconn(conn)
+    except Exception:
+        pass
+
+def _ts(dt) -> str:
+    """Convert datetime to ISO string without timezone manipulation.
+    Neon stores timestamps in local time (no tzinfo). We return them as-is
+    so the browser displays them directly without any UTC offset conversion."""
+    if dt is None:
+        return None
+    # Strip tzinfo to avoid the browser treating the value as UTC and
+    # adding the local offset on top (which caused the +5:30 shift).
+    if hasattr(dt, 'replace'):
+        return dt.replace(tzinfo=None).isoformat()
+    return str(dt)
+
 
 # --- Auth Infrastructure ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
@@ -115,7 +174,7 @@ def register(req: RegisterRequest):
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
     finally:
-        cur.close(); conn.close()
+        cur.close(); putconn(conn)
     return {"message": "User created successfully"}
 
 @app.post("/api/auth/token", response_model=Token)
@@ -124,7 +183,7 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT username, hashed_password, role FROM api_users WHERE username = %s AND is_active = TRUE", (form.username,))
     user = cur.fetchone()
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
 
     if not user or not verify_password(form.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -143,7 +202,7 @@ def get_machines(token: dict = Depends(require_auth)):
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT machine_id FROM oee_data ORDER BY machine_id;")
     rows = cur.fetchall()
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     return [r[0] for r in rows]
 
 @app.get("/api/oee/latest")
@@ -158,10 +217,10 @@ def get_latest(machine: str = Query(...), token: dict = Depends(require_auth)):
         LIMIT 1;
     """, (machine,))
     row = cur.fetchone()
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     if row:
-        row["window_start"] = row["window_start"].isoformat()
-        row["window_end"] = row["window_end"].isoformat()
+        row["window_start"] = _ts(row["window_start"])
+        row["window_end"] = _ts(row["window_end"])
     return dict(row) if row else {}
 
 @app.get("/api/oee/history")
@@ -176,10 +235,10 @@ def get_history(machine: str = Query(...), limit: int = 30, token: dict = Depend
         LIMIT %s;
     """, (machine, limit))
     rows = cur.fetchall()
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
-        r["window_start"] = r["window_start"].isoformat()
-        r["window_end"] = r["window_end"].isoformat()
+        r["window_start"] = _ts(r["window_start"])
+        r["window_end"] = _ts(r["window_end"])
     return [dict(r) for r in reversed(rows)]
 
 @app.get("/api/oee/stats")
@@ -197,7 +256,7 @@ def get_stats(machine: str = Query(...), token: dict = Depends(require_auth)):
           AND window_start >= NOW() - INTERVAL '24 hours';
     """, (machine,))
     row = cur.fetchone()
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     return dict(row) if row else {}
 
 @app.get("/api/datalake/partitions")
@@ -238,10 +297,10 @@ def get_alerts(
     """, params + [limit])
     rows = [dict(r) for r in cur.fetchall()]
     for r in rows:
-        r["window_start"] = r["window_start"].isoformat()
-        r["window_end"]   = r["window_end"].isoformat()
-        r["created_at"]   = r["created_at"].isoformat()
-    cur.close(); conn.close()
+        r["window_start"] = _ts(r["window_start"])
+        r["window_end"]   = _ts(r["window_end"])
+        r["created_at"]   = _ts(r["created_at"])
+    cur.close(); putconn(conn)
     return rows
 
 @app.post("/api/alerts/{alert_id}/acknowledge")
@@ -249,7 +308,7 @@ def acknowledge_alert(alert_id: int, token: dict = Depends(require_auth)):
     conn = get_conn()
     cur  = conn.cursor()
     cur.execute("UPDATE oee_alerts SET acknowledged = TRUE WHERE id = %s;", (alert_id,))
-    conn.commit(); cur.close(); conn.close()
+    conn.commit(); cur.close(); putconn(conn)
     return {"acknowledged": True, "alert_id": alert_id}
 
 # --- New Analytics Endpoints ---
@@ -275,10 +334,10 @@ def get_apq(machine: Optional[str] = Query(None), limit: int = Query(30), token:
             ORDER BY machine_id, window_end DESC;
         """)
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
-        r["window_start"] = r["window_start"].isoformat()
-        r["window_end"]   = r["window_end"].isoformat()
+        r["window_start"] = _ts(r["window_start"])
+        r["window_end"]   = _ts(r["window_end"])
     return rows
 
 @app.get("/api/machines/compare")
@@ -292,9 +351,9 @@ def get_machines_compare(token: dict = Depends(require_auth)):
         ORDER BY machine_id, window_end DESC;
     """)
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
-        r["window_end"] = r["window_end"].isoformat()
+        r["window_end"] = _ts(r["window_end"])
     rows.sort(key=lambda r: r["avg_oee"] if r["avg_oee"] is not None else 0)
     return rows
 
@@ -319,9 +378,9 @@ def get_spc(machine: Optional[str] = Query(None), token: dict = Depends(require_
             ORDER BY machine_id, calculated_at DESC;
         """)
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
-        r["calculated_at"] = r["calculated_at"].isoformat()
+        r["calculated_at"] = _ts(r["calculated_at"])
     return rows
 
 @app.get("/api/shifts")
@@ -352,7 +411,7 @@ def get_shifts(
             ORDER BY machine_id, shift, shift_date DESC;
         """, (days,))
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
         r["shift_date"] = r["shift_date"].isoformat()
     return rows
@@ -378,10 +437,10 @@ def get_forecast(machine: str = Query(...), token: dict = Depends(require_auth))
         ORDER BY target_time ASC;
     """, (machine, machine))
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
-        r["target_time"]     = r["target_time"].isoformat()
-        r["prediction_time"] = r["prediction_time"].isoformat()
+        r["target_time"]     = _ts(r["target_time"])
+        r["prediction_time"] = _ts(r["prediction_time"])
     return rows
 
 
@@ -425,12 +484,12 @@ def get_forecast_vs_actual(machine: str = Query(...), token: dict = Depends(requ
         ORDER BY p.target_time ASC;
     """, (machine,))
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
-        r["target_time"]     = r["target_time"].isoformat()
-        r["prediction_time"] = r["prediction_time"].isoformat()
-        if r["window_start"]: r["window_start"] = r["window_start"].isoformat()
-        if r["window_end"]:   r["window_end"]   = r["window_end"].isoformat()
+        r["target_time"]     = _ts(r["target_time"])
+        r["prediction_time"] = _ts(r["prediction_time"])
+        if r["window_start"]: r["window_start"] = _ts(r["window_start"])
+        if r["window_end"]:   r["window_end"]   = _ts(r["window_end"])
     return rows
 
 @app.get("/api/losses")
@@ -475,7 +534,7 @@ def get_losses(machine: Optional[str] = Query(None), token: dict = Depends(requi
             ORDER BY loss_minutes DESC;
         """)
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     # Ensure numeric types are JSON-serialisable
     for r in rows:
         r["loss_minutes"]           = float(r["loss_minutes"] or 0)
@@ -510,17 +569,17 @@ async def websocket_oee(websocket: WebSocket):
                     ORDER BY machine_id, window_end ASC;
                 """)
                 rows = [dict(r) for r in cur.fetchall()]
-                cur.close(); conn.close()
+                cur.close(); putconn(conn)
                 for r in rows:
-                    r["window_start"] = r["window_start"].isoformat()
-                    r["window_end"]   = r["window_end"].isoformat()
+                    r["window_start"] = _ts(r["window_start"])
+                    r["window_end"]   = _ts(r["window_end"])
                 return rows
 
             rows = await asyncio.to_thread(fetch_oee)
             await websocket.send_json({
                 "type": "oee_update",
                 "data": rows,
-                "pushed_at": datetime.utcnow().isoformat()
+                "pushed_at": datetime.utcnow().isoformat() + "Z"
             })
     except (WebSocketDisconnect, asyncio.CancelledError):
         manager.disconnect(websocket)
@@ -539,9 +598,11 @@ def get_raw_events(machine: str = Query(...), limit: int = Query(15), token: dic
         LIMIT %s;
     """, (machine, limit))
     rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    cur.close(); putconn(conn)
     for r in rows:
-        r["event_time"] = r["event_time"].isoformat()
+        # Always emit UTC ISO string with Z suffix so browser parses timezone correctly
+        ts = r["event_time"]
+        r["event_time"] = _ts(ts)
     # Return in ascending order for charting
     return list(reversed(rows))
 
@@ -576,16 +637,17 @@ async def websocket_oee_raw(websocket: WebSocket):
                     ORDER BY machine_id, event_time ASC;
                 """)
                 rows = [dict(r) for r in cur.fetchall()]
-                cur.close(); conn.close()
+                cur.close(); putconn(conn)
                 for r in rows:
-                    r["event_time"] = r["event_time"].isoformat()
+                    ts = r["event_time"]
+                    r["event_time"] = _ts(ts)
                 return rows
 
             rows = await asyncio.to_thread(fetch_raw)
             await websocket.send_json({
                 "type": "oee_raw_update",
                 "data": rows,
-                "pushed_at": datetime.utcnow().isoformat()
+                "pushed_at": datetime.utcnow().isoformat() + "Z"
             })
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
@@ -618,11 +680,11 @@ async def websocket_alerts(websocket: WebSocket):
                     LIMIT 50;
                 """)
                 alerts = [dict(r) for r in cur.fetchall()]
-                cur.close(); conn.close()
+                cur.close(); putconn(conn)
                 for a in alerts:
-                    a["window_start"] = a["window_start"].isoformat()
-                    a["window_end"]   = a["window_end"].isoformat()
-                    a["created_at"]   = a["created_at"].isoformat()
+                    a["window_start"] = _ts(a["window_start"])
+                    a["window_end"]   = _ts(a["window_end"])
+                    a["created_at"]   = _ts(a["created_at"])
                 return alerts
 
             alerts = await asyncio.to_thread(fetch_alerts)

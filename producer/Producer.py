@@ -435,7 +435,7 @@ def _on_delivery(err, msg):
 print("🚀 OEE Producer started")
 print(f"   Machines : {', '.join(MACHINE_PROFILES)}")
 print(f"   Topic    : {TOPIC}")
-print(f"   Interval : 0.5 s per cycle (all machines)\n")
+print(f"   Interval : 3 s per cycle (all machines) — 1 new point per chart refresh\n")
 
 _cycle = 0
 
@@ -459,9 +459,8 @@ try:
 
         producer.poll(0)
 
-        # Print a summary every 50 cycles (~25 s) instead of every message.
-        # This keeps the log clean while still showing the system is alive.
-        if _cycle % 50 == 0:
+        # Print a summary every 10 cycles (~30 s)
+        if _cycle % 10 == 0:
             sample = simulators[list(simulators)[0]].next_window()
             print(
                 f"  [cycle {_cycle:>6}] "
@@ -472,7 +471,8 @@ try:
                 f"Q={sample['quality']:5.1f}%"
             )
 
-        time.sleep(0.5)
+        # 3 s matches the chart poll interval → exactly 1 new point per refresh
+        time.sleep(3.0)
 
 except KeyboardInterrupt:
     print("\n⏹  Stopped by user.")

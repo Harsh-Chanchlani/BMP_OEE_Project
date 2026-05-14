@@ -61,7 +61,9 @@ def _load_env(path=None):
 
 _load_env()
 
-DB_CONF = dict(
+# Use DATABASE_URL (Neon) if set, otherwise fall back to local PG env vars
+_DATABASE_URL = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+DB_CONF = _DATABASE_URL if _DATABASE_URL else dict(
     dbname   = os.getenv("PGDATABASE", "oee_db"),
     user     = os.getenv("PGUSER",     "harshchanchlani"),
     password = os.getenv("PGPASSWORD", ""),
@@ -186,7 +188,7 @@ def _fit_and_forecast(oee_values: list[float]) -> tuple[list, list, list] | None
 
 def run_once():
     """Fit ARIMA for every machine and write forecasts to DB."""
-    conn = psycopg2.connect(**DB_CONF)
+    conn = psycopg2.connect(DB_CONF) if isinstance(DB_CONF, str) else psycopg2.connect(**DB_CONF)
     try:
         machines = _get_machines(conn)
         if not machines:

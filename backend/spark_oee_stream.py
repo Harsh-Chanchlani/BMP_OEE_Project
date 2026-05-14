@@ -36,6 +36,7 @@ Note: The producer already computes A/P/Q/OEE from raw inputs.
 import json
 import os
 import statistics
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -101,7 +102,9 @@ ALERT_TOPIC = os.getenv("ALERT_TOPIC", "OEE_ALERTS")
 WARN_THRESHOLD = float(os.getenv("OEE_WARNING_THRESHOLD",  "55.0"))
 CRIT_THRESHOLD = float(os.getenv("OEE_CRITICAL_THRESHOLD", "40.0"))
 
-DB_CONF = dict(
+# Use DATABASE_URL (Neon) if set, otherwise fall back to local PG env vars
+_DATABASE_URL = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+DB_CONF = _DATABASE_URL if _DATABASE_URL else dict(
     dbname   = os.getenv("PGDATABASE", "oee_db"),
     user     = os.getenv("PGUSER",     "harshchanchlani"),
     password = os.getenv("PGPASSWORD", ""),
@@ -153,6 +156,10 @@ spark = (
     .config("spark.jars.packages",          all_pkgs)
     .config("spark.sql.shuffle.partitions", "4")    # small for single-node
     .config("spark.ui.enabled",             "false") # save memory
+    # Force UTC throughout — from_unixtime() uses the session timezone.
+    # Without this, timestamps are stored in the JVM's local timezone and
+    # displayed incorrectly in the browser (e.g. 11 AM instead of 5:40 PM).
+    .config("spark.sql.session.timeZone",   "UTC")
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
@@ -240,10 +247,47 @@ windowed_df = (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _db_connect():
-    return psycopg2.connect(**DB_CONF)
+    """
+    Connect to Neon (or local PG) with generous timeouts.
+    Neon serverless instances cold-start in ~1-3s and can have higher
+    network latency than a local DB, so we raise all timeout values.
+    """
+    connect_timeout = int(os.getenv("PG_CONNECT_TIMEOUT", "30"))   # seconds to establish TCP
+    options = (
+        f"-c statement_timeout={os.getenv('PG_STATEMENT_TIMEOUT', '60000')} "   # ms per statement
+        f"-c lock_timeout={os.getenv('PG_LOCK_TIMEOUT', '30000')} "             # ms waiting for locks
+        f"-c idle_in_transaction_session_timeout={os.getenv('PG_IDLE_TX_TIMEOUT', '60000')}"  # ms idle in tx
+    )
+    if isinstance(DB_CONF, str):
+        return psycopg2.connect(
+            DB_CONF,
+            connect_timeout=connect_timeout,
+            options=options,
+        )
+    return psycopg2.connect(
+        **DB_CONF,
+        connect_timeout=connect_timeout,
+        options=options,
+    )
 
 
-def _shift_for_hour(h: int) -> str:
+def _db_connect_with_retry(max_attempts: int = 5, base_delay: float = 2.0):
+    """
+    Retry wrapper for _db_connect().
+    Neon serverless can take a few seconds to wake from idle, so we retry
+    with exponential back-off before giving up.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _db_connect()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                delay = base_delay * (2 ** (attempt - 1))   # 2s, 4s, 8s, 16s
+                print(f"[WARN] DB connect attempt {attempt}/{max_attempts} failed: {exc} — retrying in {delay:.0f}s")
+                time.sleep(delay)
+    raise last_exc
     if 6 <= h < 14:
         return "morning"
     if 14 <= h < 22:
@@ -255,10 +299,10 @@ def _shift_for_hour(h: int) -> str:
 
 def _write_raw_events(conn, rows: list):
     """
-    Insert individual OEE readings into oee_raw_events.
-    One row per Kafka message — used for time-series charts and ML.
+    Insert individual OEE readings into oee_raw_events using executemany()
+    — single round-trip to Neon instead of one per row.
     """
-    cur = conn.cursor()
+    params = []
     for r in rows:
         if not r.machine_id or r.oee is None:
             continue
@@ -269,16 +313,8 @@ def _write_raw_events(conn, rows: list):
             if r.timestamp else _utcnow()
         )
         loss_name = r.loss_category.name      if r.loss_category else "none"
-        loss_type = r.loss_category.type      if r.loss_category else "none"
         loss_comp = r.loss_category.component if r.loss_category else "none"
-
-        cur.execute("""
-            INSERT INTO oee_raw_events
-              (machine_id, event_time, oee, availability, performance, quality,
-               lot_id, shift, loss_event_name, loss_event_component, message_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-        """, (
+        params.append((
             r.machine_id, event_time,
             round(r.oee,          4),
             round(r.availability  or 0, 4),
@@ -289,6 +325,16 @@ def _write_raw_events(conn, rows: list):
             loss_name, loss_comp,
             getattr(r, "message_id", None),
         ))
+    if not params:
+        return
+    cur = conn.cursor()
+    cur.executemany("""
+        INSERT INTO oee_raw_events
+          (machine_id, event_time, oee, availability, performance, quality,
+           lot_id, shift, loss_event_name, loss_event_component, message_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, params)
+    cur.close()
 
 
 def _write_loss_categories(conn, rows: list):
@@ -577,11 +623,11 @@ def _upsert_shift_performance(conn, rows: list):
 # STREAM A — foreachBatch: raw events + loss categories
 # ═══════════════════════════════════════════════════════════════════════════════
 def write_raw_batch(batch_df, batch_id):
-    """Called every 10 s with raw parsed messages."""
+    """Called every 3 s with raw parsed messages."""
     rows = batch_df.collect()
     if not rows:
         return
-    conn = _db_connect()
+    conn = _db_connect_with_retry()
     try:
         _write_raw_events(conn, rows)
         _write_loss_categories(conn, rows)
@@ -602,7 +648,7 @@ def write_windowed_batch(batch_df, batch_id):
     if not rows:
         return
 
-    conn      = _db_connect()
+    conn      = _db_connect_with_retry()
     batch_ts  = _utcnow()
 
     try:
@@ -646,7 +692,7 @@ def write_windowed_batch(batch_df, batch_id):
 def _ensure_schema():
     """Add any missing columns and constraints to existing tables."""
     try:
-        conn = _db_connect()
+        conn = _db_connect_with_retry()
         cur  = conn.cursor()
 
         # Ensure APQ columns exist on oee_data

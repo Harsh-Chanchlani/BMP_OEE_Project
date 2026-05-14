@@ -215,3 +215,14 @@ CREATE INDEX IF NOT EXISTS idx_oee_raw_machine_time
 
 CREATE INDEX IF NOT EXISTS idx_oee_raw_event_time
   ON oee_raw_events (event_time DESC);
+-- ============================================
+-- API USERS
+-- ============================================
+CREATE TABLE IF NOT EXISTS api_users (
+  id BIGSERIAL PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  hashed_password TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'viewer',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);

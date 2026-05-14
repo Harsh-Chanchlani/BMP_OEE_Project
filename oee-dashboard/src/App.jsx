@@ -11,6 +11,28 @@ import { useRawOeeWebSocket } from "./hooks/useRawOeeWebSocket";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
+// ── UTC timestamp normaliser ──────────────────────────────────────────────────
+// Neon stores timestamps as local time (no timezone info).
+// We display them directly without any UTC conversion — just parse as-is
+// and format using the browser's locale for a clean time string.
+function toLocalTime(ts) {
+  if (!ts) return "";
+  const s = String(ts);
+  // Strip any trailing Z or offset that might have been added — the value
+  // is already in local time as stored by Spark/Postgres on this machine.
+  const bare = s.replace(/Z$/, "").replace(/[+-]\d{2}:\d{2}$/, "");
+  const d = new Date(bare);
+  return isNaN(d.getTime()) ? s : d.toLocaleTimeString();
+}
+
+function toLocalDateTime(ts) {
+  if (!ts) return "";
+  const s = String(ts);
+  const bare = s.replace(/Z$/, "").replace(/[+-]\d{2}:\d{2}$/, "");
+  const d = new Date(bare);
+  return isNaN(d.getTime()) ? s : d.toLocaleString();
+}
+
 // ── Threshold helper ──────────────────────────────────────────────────────────
 function getThreshold(value) {
   if (value >= 85) return { label: "WORLD CLASS", color: "#00ff87", bg: "rgba(0,255,135,0.1)" };
@@ -245,20 +267,23 @@ function RealTimeOeeChart({ machine }) {
 
   useEffect(() => {
     fetchRaw();
+    // Poll every 3s — matches Spark Stream A trigger interval
     intervalRef.current = setInterval(fetchRaw, 3000);
     return () => clearInterval(intervalRef.current);
   }, [fetchRaw]);
 
-  const chartData = rawData.map((r) => ({
-    time: new Date(r.event_time).toLocaleTimeString(),
-    oee: parseFloat(Number(r.oee).toFixed(2)),
-    loss: r.loss_event_name && r.loss_event_name !== "none" ? r.loss_event_name : null,
-    availability: parseFloat(Number(r.availability || 0).toFixed(2)),
-    performance:  parseFloat(Number(r.performance  || 0).toFixed(2)),
-    quality:      parseFloat(Number(r.quality      || 0).toFixed(2)),
-    lot_id: r.lot_id || null,
-    shift:  r.shift  || null,
-  }));
+  const chartData = rawData.map((r) => {
+    return {
+      time: toLocalTime(r.event_time),
+      oee: parseFloat(Number(r.oee).toFixed(2)),
+      loss: r.loss_event_name && r.loss_event_name !== "none" ? r.loss_event_name : null,
+      availability: parseFloat(Number(r.availability || 0).toFixed(2)),
+      performance:  parseFloat(Number(r.performance  || 0).toFixed(2)),
+      quality:      parseFloat(Number(r.quality      || 0).toFixed(2)),
+      lot_id: r.lot_id || null,
+      shift:  r.shift  || null,
+    };
+  });
 
   return (
     <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)",
@@ -387,7 +412,7 @@ function ForecastChart({ machine, windowedHistory }) {
       .then((d) => {
         if (!Array.isArray(d)) return;
         setRestHistory(d.map((r) => ({
-          time: new Date(r.window_start).toLocaleTimeString(),
+          time: toLocalTime(r.window_start),
           oee: parseFloat(Number(r.avg_oee).toFixed(2)),
         })));
       })
@@ -682,13 +707,13 @@ function PredictedVsActualChart({ machine }) {
         if (Array.isArray(data)) {
           // Parse and format the data
           const formatted = data.map((r) => ({
-            target_time: new Date(r.target_time).toLocaleTimeString(),
+            target_time: toLocalTime(r.target_time),
             predicted_oee: r.predicted_oee != null ? parseFloat(Number(r.predicted_oee).toFixed(2)) : null,
             actual_oee: r.actual_oee != null ? parseFloat(Number(r.actual_oee).toFixed(2)) : null,
             confidence_lower: r.confidence_lower != null ? parseFloat(Number(r.confidence_lower).toFixed(2)) : null,
             confidence_upper: r.confidence_upper != null ? parseFloat(Number(r.confidence_upper).toFixed(2)) : null,
-            prediction_time: r.prediction_time ? new Date(r.prediction_time).toLocaleTimeString() : null,
-            ts: new Date(r.target_time).getTime(),
+            prediction_time: r.prediction_time ? toLocalTime(r.prediction_time) : null,
+            ts: new Date(String(r.target_time).replace(/Z$/, "").replace(/[+-]\d{2}:\d{2}$/, "")).getTime(),
           }));
           // Sort by timestamp and take last 24 hours worth (assuming 30s windows = ~2880 points per day)
           // For display purposes, limit to last 48 points (~24 minutes at 30s intervals)
@@ -891,7 +916,7 @@ function ApqChart({ machine }) {
   }, [machine]);
 
   const formatted = apqData.map((r) => ({
-    time: new Date(r.window_start).toLocaleTimeString(),
+    time: toLocalTime(r.window_start),
     avg_availability: parseFloat(Number(r.avg_availability || 0).toFixed(2)),
     avg_performance:  parseFloat(Number(r.avg_performance  || 0).toFixed(2)),
     avg_quality:      parseFloat(Number(r.avg_quality      || 0).toFixed(2)),
@@ -1383,7 +1408,7 @@ function AlertLog({ alerts }) {
                     )}
                   </div>
                   <div style={{ fontSize: 9, color: "rgba(255,255,255,0.25)", marginTop: 2 }}>
-                    {a.created_at ? new Date(a.created_at).toLocaleString() : ""}
+                    {a.created_at ? toLocalDateTime(a.created_at) : ""}
                   </div>
                 </div>
                 <button
@@ -1446,7 +1471,7 @@ function FleetView({ machines }) {
             .sort((a, b) => new Date(a.event_time) - new Date(b.event_time))
             .slice(-30)
             .map((r) => ({
-              time: new Date(r.event_time).toLocaleTimeString(),
+              time: toLocalTime(r.event_time),
               oee: parseFloat(Number(r.oee).toFixed(2)),
               loss: r.loss_event_name && r.loss_event_name !== "none" ? r.loss_event_name : null,
             }));
@@ -1553,10 +1578,10 @@ function WindowAggregatesTable({ machine, history }) {
                   onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
                   <td style={{ padding: "10px 20px", fontSize: 12, color: "#60a5fa" }}>{machine}</td>
                   <td style={{ padding: "10px 20px", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
-                    {row.window_start ? new Date(row.window_start).toLocaleTimeString() : row.time}
+                    {row.window_start ? toLocalTime(row.window_start) : row.time}
                   </td>
                   <td style={{ padding: "10px 20px", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
-                    {row.window_end ? new Date(row.window_end).toLocaleTimeString() : "—"}
+                    {row.window_end ? toLocalTime(row.window_end) : "—"}
                   </td>
                   <td style={{ padding: "10px 20px", fontSize: 13, color: t.color, fontWeight: 700 }}>
                     {row.oee.toFixed(2)}%
@@ -1589,6 +1614,9 @@ function Dashboard() {
   const [error, setError]             = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
   const [view, setView]               = useState("machine"); // "machine" | "fleet"
+  // Latest raw reading — same source as the Real-Time OEE chart
+  const [latestRaw, setLatestRaw]     = useState(null);
+  const rawPollRef                    = useRef(null);
 
   const { oeeData, connected: wsConnected } = useOeeWebSocket();
   const { alerts }                          = useAlertsWebSocket();
@@ -1598,16 +1626,36 @@ function Dashboard() {
     .filter((r) => r.machine_id === machine)
     .sort((a, b) => new Date(a.window_start) - new Date(b.window_start))
     .map((r) => ({
-      time: new Date(r.window_start).toLocaleTimeString(),
+      time: toLocalTime(r.window_start),
       oee: parseFloat(Number(r.avg_oee).toFixed(2)),
       window_start: r.window_start,
       window_end: r.window_end,
     }));
 
-  // Latest OEE value — prefer most recent windowed window
-  const latestWindow = history.length > 0 ? history[history.length - 1] : null;
-  const oeeVal = Number(latestWindow?.oee || 0);
+  // Poll the same raw endpoint the Real-Time chart uses (every 3 s) so the
+  // gauge always matches the rightmost point on that chart.
+  const fetchLatestRaw = useCallback(() => {
+    if (!machine) return;
+    fetch(`${API}/api/oee/raw?machine=${machine}&limit=1`, { headers: authHeader() })
+      .then((r) => r.ok ? r.json() : [])
+      .then((data) => {
+        if (Array.isArray(data) && data.length > 0)
+          setLatestRaw(data[data.length - 1]);
+      })
+      .catch(() => {});
+  }, [machine]);
+
+  useEffect(() => {
+    setLatestRaw(null); // reset on machine change
+    fetchLatestRaw();
+    rawPollRef.current = setInterval(fetchLatestRaw, 3000);
+    return () => clearInterval(rawPollRef.current);
+  }, [fetchLatestRaw]);
+
+  // Latest OEE — from raw events (matches Real-Time chart's rightmost point)
+  const oeeVal = latestRaw ? parseFloat(Number(latestRaw.oee).toFixed(2)) : 0;
   const thresh = getThreshold(oeeVal);
+  const latestWindow = history.length > 0 ? history[history.length - 1] : null;
 
   // Fetch machine list once
   useEffect(() => {
@@ -1754,13 +1802,13 @@ function Dashboard() {
               <GaugeArc value={oeeVal} size={140} />
               <StatusBadge value={oeeVal} />
               <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, textAlign: "center" }}>
-                {latestWindow?.window_start
-                  ? `Window: ${new Date(latestWindow.window_start).toLocaleTimeString()}`
+                {latestRaw?.event_time
+                  ? `Raw event: ${toLocalTime(latestRaw.event_time)}`
                   : "No data yet"}
               </div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: "1fr 1fr", gap: 12 }}>
-              <StatCard label="Latest OEE"    value={oeeVal}   color="#00ff87" icon="◈" sub={`Machine: ${machine}`} />
+              <StatCard label="Latest OEE"    value={oeeVal}   color="#00ff87" icon="◈" sub={`Raw · ${machine}`} />
               <StatCard label="24h Avg OEE"   value={avg24h}   color="#f59e0b" icon="∿" sub="Last 24 hours" />
               <StatCard label="24h Max OEE"   value={maxOEE}   color="#34d399" icon="↑" sub="Last 24 hours" />
               <StatCard label="24h Min OEE"   value={minOEE}   color="#ff6b6b" icon="↓" sub="Last 24 hours" />
